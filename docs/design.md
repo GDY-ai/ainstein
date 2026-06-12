@@ -13,9 +13,6 @@
 - **持续积累**：Findings + Director Memory 形成知识库，跨 session 传递上下文
 - **自动化**：APScheduler 定时触发，无需人工干预
 
-### 1.3 与 us-stock-analyzer 的关系
-
-从 us-stock-analyzer 的研究实验室剥离。原实验室深度耦合股票领域（因子 IC、regime、FACTOR_SIGNS），AInstein 抽象为通用平台。
 
 ## 2. 架构
 
