@@ -44,7 +44,7 @@ export default function CreateBrain() {
       })
       // 短暂展示「点燃」动画后跳转
       setTimeout(() => {
-        navigate(`/project/${r.brain.id}`, { replace: true })
+        navigate(`/brain/${r.brain.id}`, { replace: true })
       }, 900)
     } catch (e: any) {
       setError(e?.message || '创建失败')

@@ -13,6 +13,10 @@
 - [data_access.py](file://tools/data_access.py)
 - [cognitive.py](file://cognitive.py)
 - [api.ts](file://frontend/src/api.ts)
+- [auth.py](file://auth.py)
+- [observer.py](file://observer.py)
+- [deliberation.py](file://deliberation.py)
+- [framework.py](file://agents/framework.py)
 - [README.md](file://README.md)
 </cite>
 
@@ -29,10 +33,10 @@
 10. [附录](#附录)
 
 ## 简介
-本API参考文档面向开发者与集成方，系统化梳理AInstein平台的RESTful接口，覆盖项目管理、队列管理、会话管理、发现管理、数据集管理、科学家/主任/研究员调度接口，以及新增的**脑管理API**。新增的8个脑管理API端点支持认知元素的CRUD操作、关系管理、知识图谱检索和认知边界获取，为构建智能体的认知基础设施提供完整能力。文档提供每个接口的HTTP方法、URL模式、请求参数、响应格式、状态码说明，并补充认证机制、安全考虑、版本管理与向后兼容策略、错误处理与调试建议，以及常见使用场景的请求/响应示例路径。
+本API参考文档面向开发者与集成方，系统化梳理AInstein平台的RESTful接口，覆盖项目管理、队列管理、会话管理、发现管理、数据集管理、科学家/主任/研究员调度接口，以及新增的**用户认证、大脑管理、博弈系统、观察员监控**等相关接口。新增的认证体系提供用户注册、登录与权限控制；大脑管理API支持大脑生命周期管理、认知元素与关系的CRUD操作、知识图谱检索和认知边界获取；博弈系统提供多智能体参与的决策引擎；观察员监控实现上帝视角的总结与报告生成功能。文档提供每个接口的HTTP方法、URL模式、请求参数、响应格式、状态码说明，并补充认证机制、安全考虑、版本管理与向后兼容策略、错误处理与调试建议，以及常见使用场景的请求/响应示例路径。
 
 ## 项目结构
-后端采用Flask应用，提供统一的前缀路径/ainstein/api，前端通过/ainstein/提供SPA静态资源。WSGI入口负责调度器初始化与锁控制，数据库层封装SQLite Schema与CRUD操作，Agent层负责业务编排，引擎层提供研究流程实现，工具层提供数据访问与统计工具。**新增的脑管理模块**通过cognitive.py提供认知元素、关系和知识图谱的核心业务逻辑。
+后端采用Flask应用，提供统一的前缀路径/ainstein/api，前端通过/ainstein/提供SPA静态资源。WSGI入口负责调度器初始化与锁控制，数据库层封装SQLite Schema与CRUD操作，Agent层负责业务编排，引擎层提供研究流程实现，工具层提供数据访问与统计工具。**新增的认证模块**通过auth.py提供密码哈希、JWT令牌签发与校验、Flask装饰器等认证能力；**新增的大脑管理模块**通过cognitive.py提供认知元素、关系和知识图谱的核心业务逻辑；**新增的博弈系统**通过deliberation.py实现多智能体决策引擎；**新增的观察员系统**通过observer.py提供上帝视角监控与报告生成。
 
 ```mermaid
 graph TB
@@ -43,7 +47,10 @@ subgraph "后端"
 WSGI["WSGI入口<br/>wsgi.py"]
 APP["Flask应用<br/>app.py"]
 DB["数据库层<br/>database.py"]
+AUTH["认证模块<br/>auth.py"]
 COG["认知业务层<br/>cognitive.py"]
+DELIB["博弈引擎<br/>deliberation.py"]
+OBS["观察员系统<br/>observer.py"]
 AG_SCI["科学家Agent<br/>agents/scientist.py"]
 AG_DIR["主任Agent<br/>agents/director.py"]
 AG_RES["研究员Agent<br/>agents/researcher.py"]
@@ -53,7 +60,10 @@ end
 FE --> APP
 WSGI --> APP
 APP --> DB
+APP --> AUTH
 APP --> COG
+APP --> DELIB
+APP --> OBS
 APP --> AG_SCI
 APP --> AG_DIR
 APP --> AG_RES
@@ -63,13 +73,18 @@ AG_DIR --> DB
 AG_RES --> DB
 ENG --> TOOLS
 COG --> DB
+DELIB --> DB
+OBS --> DB
 ```
 
 **图表来源**
-- [app.py:1-182](file://app.py#L1-L182)
+- [app.py:1-1050](file://app.py#L1-L1050)
 - [wsgi.py:1-83](file://wsgi.py#L1-L83)
-- [database.py:1-344](file://database.py#L1-L344)
-- [cognitive.py:1-359](file://cognitive.py#L1-L359)
+- [database.py:1-662](file://database.py#L1-L662)
+- [auth.py:1-251](file://auth.py#L1-L251)
+- [cognitive.py:1-325](file://cognitive.py#L1-L325)
+- [deliberation.py:1-419](file://deliberation.py#L1-L419)
+- [observer.py:1-172](file://observer.py#L1-L172)
 - [researcher.py:1-114](file://agents/researcher.py#L1-L114)
 - [scientist.py:1-75](file://agents/scientist.py#L1-L75)
 - [director.py:1-124](file://agents/director.py#L1-L124)
@@ -84,11 +99,22 @@ COG --> DB
 - 路由与入口
   - 前端静态资源路由：/ainstein/ 与 /ainstein/assets/*
   - 健康检查：/ainstein/api/health
+- 认证模块
+  - 用户注册：POST /ainstein/api/auth/register
+  - 用户登录：POST /ainstein/api/auth/login
+  - 获取当前用户：GET /ainstein/api/auth/me
+  - 认证装饰器：@require_auth, @require_admin
 - 数据库层
   - 提供项目、队列、会话、发现、数据集、指令、记忆等表的CRUD与查询
+  - **新增用户表**：users（id, username, email, password_hash, role, status）
+  - **新增大脑表**：brains（id, name, seed_question, owner_user_id, state, config_json）
   - **新增认知数据库表**：cognitive_elements、cognitive_relations
 - 认知业务层
   - **新增**：认知元素CRUD、关系管理、知识图谱聚合、认知边界计算
+- 博弈系统
+  - **新增**：多智能体博弈引擎，支持发起、执行、投票、判定等完整流程
+- 观察员系统
+  - **新增**：上帝视角监控，支持自动总结与手动触发
 - Agent与引擎
   - 科学家：生成指令与初始主题
   - 主任：每日复盘、队列治理、记忆积累
@@ -97,9 +123,15 @@ COG --> DB
   - 数据集加载与摘要生成
 
 **章节来源**
-- [app.py:43-177](file://app.py#L43-L177)
-- [database.py:101-344](file://database.py#L101-L344)
-- [cognitive.py:1-359](file://cognitive.py#L1-L359)
+- [app.py:69-137](file://app.py#L69-L137)
+- [app.py:190-376](file://app.py#L190-L376)
+- [app.py:507-1050](file://app.py#L507-L1050)
+- [database.py:118-151](file://database.py#L118-L151)
+- [database.py:603-662](file://database.py#L603-L662)
+- [auth.py:196-223](file://auth.py#L196-L223)
+- [cognitive.py:1-325](file://cognitive.py#L1-L325)
+- [deliberation.py:121-419](file://deliberation.py#L121-L419)
+- [observer.py:136-172](file://observer.py#L136-L172)
 - [researcher.py:14-114](file://agents/researcher.py#L14-L114)
 - [scientist.py:14-75](file://agents/scientist.py#L14-L75)
 - [director.py:14-124](file://agents/director.py#L14-L124)
@@ -107,21 +139,36 @@ COG --> DB
 - [data_access.py:10-43](file://tools/data_access.py#L10-L43)
 
 ## 架构总览
-下图展示API到数据库与Agent/引擎的交互关系，以及新增的脑管理模块如何与现有系统集成。
+下图展示API到数据库与Agent/引擎的交互关系，以及新增的认证、大脑管理、博弈系统、观察员监控模块如何与现有系统集成。
 
 ```mermaid
 sequenceDiagram
 participant Client as "客户端"
 participant Flask as "Flask路由<br/>app.py"
+participant Auth as "认证模块<br/>auth.py"
 participant Cog as "认知业务层<br/>cognitive.py"
+participant Delib as "博弈引擎<br/>deliberation.py"
+participant Obs as "观察员系统<br/>observer.py"
 participant DB as "数据库层<br/>database.py"
 participant Agent as "Agent/引擎"
 participant Tools as "工具层<br/>data_access.py"
 Client->>Flask : "HTTP 请求"
+alt 需要认证
+Flask->>Auth : "验证JWT令牌"
+Auth-->>Flask : "用户信息或401"
+end
 Flask->>Cog : "调用认知业务逻辑"
+Flask->>Delib : "调用博弈引擎"
+Flask->>Obs : "调用观察员系统"
 Cog->>DB : "读写/查询认知数据"
+Delib->>DB : "读写/查询博弈数据"
+Obs->>DB : "读写/查询观察员数据"
 DB-->>Cog : "结果/错误"
+DB-->>Delib : "结果/错误"
+DB-->>Obs : "结果/错误"
 Cog-->>Flask : "处理后的数据"
+Delib-->>Flask : "处理后的数据"
+Obs-->>Flask : "处理后的数据"
 Flask->>Agent : "触发业务逻辑"
 Agent->>Tools : "数据加载/工具调用"
 Tools-->>Agent : "结果"
@@ -131,9 +178,14 @@ Flask-->>Client : "JSON 响应"
 ```
 
 **图表来源**
-- [app.py:43-177](file://app.py#L43-L177)
-- [cognitive.py:1-359](file://cognitive.py#L1-L359)
-- [database.py:101-344](file://database.py#L101-L344)
+- [app.py:69-137](file://app.py#L69-L137)
+- [app.py:507-1050](file://app.py#L507-L1050)
+- [auth.py:196-223](file://auth.py#L196-L223)
+- [cognitive.py:1-325](file://cognitive.py#L1-L325)
+- [deliberation.py:121-419](file://deliberation.py#L121-L419)
+- [observer.py:136-172](file://observer.py#L136-L172)
+- [database.py:118-151](file://database.py#L118-L151)
+- [database.py:603-662](file://database.py#L603-L662)
 - [researcher.py:14-114](file://agents/researcher.py#L14-L114)
 - [scientist.py:14-75](file://agents/scientist.py#L14-L75)
 - [director.py:14-124](file://agents/director.py#L14-L124)
@@ -156,6 +208,67 @@ Flask-->>Client : "JSON 响应"
 
 **章节来源**
 - [app.py:43-46](file://app.py#L43-L46)
+
+### 用户认证
+
+#### 用户注册
+- 方法与路径
+  - POST /ainstein/api/auth/register
+- 请求体字段
+  - username: 字符串，长度2-32，去除首尾空格
+  - password: 字符串，长度≥6
+  - email: 可选，字符串，格式验证，长度≤128
+- 响应
+  - 成功：{"token": "jwt令牌", "user": {"id","username","email","role","status","created_at"}}
+  - 失败：{"error": "错误信息"}
+- 状态码
+  - 201 Created：注册成功
+  - 400 Bad Request：参数验证失败
+  - 409 Conflict：用户名已存在
+  - 500 Internal Server Error：服务器内部错误
+
+请求示例（用户注册）
+- 方法：POST
+- 路径：/ainstein/api/auth/register
+- 请求头：Content-Type: application/json
+- 请求体：{"username":"alice","password":"securepass","email":"alice@example.com"}
+- 响应：{"token":"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...","user":{"id":1,"username":"alice","email":"alice@example.com","role":"user","status":"active","created_at":"YYYY-MM-DD HH:MM:SS"}}
+
+#### 用户登录
+- 方法与路径
+  - POST /ainstein/api/auth/login
+- 请求体字段
+  - username 或 email: 字符串，去除首尾空格
+  - password: 字符串
+- 响应
+  - 成功：{"token": "jwt令牌", "user": 用户信息}
+  - 失败：{"error": "用户名或密码错误"} 或 {"error": "该账号已被禁用"}
+- 状态码
+  - 200 OK：登录成功
+  - 400 Bad Request：缺少必需字段
+  - 401 Unauthorized：用户名或密码错误
+  - 403 Forbidden：账号被禁用
+
+请求示例（用户登录）
+- 方法：POST
+- 路径：/ainstein/api/auth/login
+- 请求体：{"username":"alice","password":"securepass"}
+- 响应：{"token":"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...","user":{"id":1,"username":"alice","role":"user","status":"active"}}
+
+#### 获取当前用户
+- 方法与路径
+  - GET /ainstein/api/auth/me
+- 认证要求
+  - 需要在请求头中包含Authorization: Bearer <token>
+- 响应
+  - 成功：{"user": {"id","username","email","role","status","created_at"}}
+- 状态码
+  - 200 OK：获取成功
+  - 401 Unauthorized：认证失败
+
+**章节来源**
+- [app.py:69-137](file://app.py#L69-L137)
+- [auth.py:196-223](file://auth.py#L196-L223)
 
 ### 项目管理
 - 列出项目
@@ -187,6 +300,180 @@ Flask-->>Client : "JSON 响应"
 **章节来源**
 - [app.py:50-66](file://app.py#L50-L66)
 - [database.py:127-168](file://database.py#L127-L168)
+
+### 大脑管理API（新增）
+
+#### 大脑生命周期管理
+- 列出大脑
+  - 方法与路径：GET /ainstein/api/brains
+  - 查询参数：all?(是否显示所有状态，默认false)
+  - 响应：{"items": [...]}
+  - 状态码：200 OK；400 Bad Request
+- 创建大脑
+  - 方法与路径：POST /ainstein/api/brains
+  - 请求体字段：name, seed_question, config?(可选)
+  - 响应：大脑对象
+  - 状态码：201 Created；400 Bad Request；401 Unauthorized
+- 获取大脑详情
+  - 方法与路径：GET /ainstein/api/brains/{brain_id}
+  - 路径参数：brain_id
+  - 响应：大脑对象
+  - 状态码：200 OK；404 Not Found
+- 暂停大脑
+  - 方法与路径：POST /ainstein/api/brains/{brain_id}/pause
+  - 路径参数：brain_id
+  - 响应：{"status": "paused", "brain": 大脑对象}
+  - 状态码：200 OK；404 Not Found；401 Unauthorized
+- 恢复大脑
+  - 方法与路径：POST /ainstein/api/brains/{brain_id}/resume
+  - 路径参数：brain_id
+  - 响应：{"status": "active", "brain": 大脑对象}
+  - 状态码：200 OK；404 Not Found；401 Unauthorized
+
+请求示例（创建大脑）
+- 方法：POST
+- 路径：/ainstein/api/brains
+- 请求体：{"name":"教育AI大脑","seed_question":"AI如何改变教育行业？","config":{"research_domain":"教育科技"}}
+
+响应示例（获取大脑详情）
+- 响应体：{"id":1,"name":"教育AI大脑","seed_question":"AI如何改变教育行业？","owner_user_id":1,"state":"gestating","config_json":"{\"research_domain\":\"教育科技\"}","frontier_score":0.0,"created_at":"YYYY-MM-DD HH:MM:SS","last_active_at":null}
+
+#### 认知元素管理
+- 列出认知元素
+  - 方法与路径：GET /ainstein/api/brains/{brain_id}/cognitive-elements
+  - 路径参数：brain_id
+  - 查询参数：type, min_confidence, limit, offset
+  - 响应：{"items":[...], "limit":N, "offset":M}
+  - 状态码：200 OK；400 Bad Request；404 Not Found
+- 创建认知元素
+  - 方法与路径：POST /ainstein/api/brains/{brain_id}/cognitive-elements
+  - 路径参数：brain_id
+  - 请求体字段：type, content, payload_json?, confidence?, status?, version?
+  - 响应：认知元素对象
+  - 状态码：201 Created；400 Bad Request；404 Not Found
+- 获取认知元素
+  - 方法与路径：GET /ainstein/api/brains/{brain_id}/cognitive-elements/{ce_id}
+  - 路径参数：brain_id, ce_id
+  - 响应：认知元素对象
+  - 状态码：200 OK；404 Not Found
+- 更新认知元素
+  - 方法与路径：PATCH /ainstein/api/brains/{brain_id}/cognitive-elements/{ce_id}
+  - 路径参数：brain_id, ce_id
+  - 请求体字段：content, payload_json, confidence, confidence_method, status, version, superseded_by, domain_tags
+  - 响应：更新后的认知元素对象
+  - 状态码：200 OK；400 Bad Request；404 Not Found
+- 删除认知元素
+  - 方法与路径：DELETE /ainstein/api/brains/{brain_id}/cognitive-elements/{ce_id}
+  - 路径参数：brain_id, ce_id
+  - 响应：{"status":"deleted"}
+  - 状态码：200 OK；404 Not Found
+
+请求示例（创建认知元素）
+- 方法：POST
+- 路径：/ainstein/api/brains/1/cognitive-elements
+- 请求体：{"type":"hypothesis","content":"AI在教育中的应用可能改变传统教学模式","confidence":0.8,"status":"active"}
+
+响应示例（列出认知元素）
+- 响应体：{"items":[{"id":1,"brain_id":1,"type":"hypothesis","content":"AI在教育中的应用可能改变传统教学模式","confidence":0.8,"status":"active","version":1,"created_at":"YYYY-MM-DD HH:MM:SS"}],"limit":50,"offset":0}
+
+#### 认知关系管理
+- 列出认知关系
+  - 方法与路径：GET /ainstein/api/brains/{brain_id}/cognitive-relations
+  - 路径参数：brain_id
+  - 查询参数：element_id, direction, src_id, dst_id, relation
+  - 响应：{"items":[...]}
+  - 状态码：200 OK；400 Bad Request；404 Not Found
+- 创建认知关系
+  - 方法与路径：POST /ainstein/api/brains/{brain_id}/cognitive-relations
+  - 路径参数：brain_id
+  - 请求体字段：source_id, target_id, relation_type, weight, created_by_agent_id
+  - 响应：关系对象
+  - 状态码：201 Created；400 Bad Request；404 Not Found
+
+请求示例（创建认知关系）
+- 方法：POST
+- 路径：/ainstein/api/brains/1/cognitive-relations
+- 请求体：{"source_id":1,"target_id":2,"relation_type":"supports","weight":0.9,"created_by_agent_id":101}
+
+#### 知识图谱检索
+- 获取知识图谱
+  - 方法与路径：GET /ainstein/api/brains/{brain_id}/knowledge-graph
+  - 路径参数：brain_id
+  - 查询参数：types, limit
+  - 响应：{"nodes":[...],"edges":[...]}
+  - 状态码：200 OK；400 Bad Request；404 Not Found
+
+请求示例（获取知识图谱）
+- 方法：GET
+- 路径：/ainstein/api/brains/1/knowledge-graph?types=hypothesis,fact&limit=200
+
+#### 认知边界获取
+- 获取认知边界
+  - 方法与路径：GET /ainstein/api/brains/{brain_id}/frontier
+  - 路径参数：brain_id
+  - 查询参数：limit, confidence_ceiling
+  - 响应：认知元素数组
+  - 状态码：200 OK；400 Bad Request；404 Not Found
+
+请求示例（获取认知边界）
+- 方法：GET
+- 路径：/ainstein/api/brains/1/frontier?limit=50&confidence_ceiling=0.7
+
+#### 博弈系统接口（新增）
+- 发起博弈
+  - 方法与路径：POST /ainstein/api/brains/{brain_id}/deliberations
+  - 路径参数：brain_id
+  - 请求体字段：topic, trigger_ce_id, initiator_agent_id?
+  - 响应：博弈对象
+  - 状态码：201 Created；400 Bad Request；404 Not Found
+- 列出博弈
+  - 方法与路径：GET /ainstein/api/brains/{brain_id}/deliberations
+  - 路径参数：brain_id
+  - 查询参数：status, limit
+  - 响应：博弈对象数组
+  - 状态码：200 OK；400 Bad Request；404 Not Found
+- 获取博弈详情
+  - 方法与路径：GET /ainstein/api/brains/{brain_id}/deliberations/{delib_id}
+  - 路径参数：brain_id, delib_id
+  - 响应：博弈对象
+  - 状态码：200 OK；404 Not Found
+- 运行博弈
+  - 方法与路径：POST /ainstein/api/brains/{brain_id}/deliberations/{delib_id}/run
+  - 路径参数：brain_id, delib_id
+  - 响应：执行结果
+  - 状态码：200 OK；404 Not Found
+
+#### 观察员监控接口（新增）
+- 获取观察员日志
+  - 方法与路径：GET /ainstein/api/brains/{brain_id}/observer-logs
+  - 路径参数：brain_id
+  - 查询参数：limit
+  - 响应：日志对象数组
+  - 状态码：200 OK；404 Not Found
+- 获取最新观察员日志
+  - 方法与路径：GET /ainstein/api/brains/{brain_id}/observer-logs/latest
+  - 路径参数：brain_id
+  - 响应：日志对象
+  - 状态码：200 OK；404 Not Found
+- 生成观察员日志
+  - 方法与路径：POST /ainstein/api/brains/{brain_id}/observer-logs/generate
+  - 路径参数：brain_id
+  - 响应：生成结果
+  - 状态码：200 OK；404 Not Found
+- 获取指定观察员日志
+  - 方法与路径：GET /ainstein/api/brains/{brain_id}/observer-logs/{log_id}
+  - 路径参数：brain_id, log_id
+  - 响应：日志对象
+  - 状态码：200 OK；404 Not Found
+
+**章节来源**
+- [app.py:190-376](file://app.py#L190-L376)
+- [app.py:507-1050](file://app.py#L507-L1050)
+- [cognitive.py:1-325](file://cognitive.py#L1-L325)
+- [database.py:118-151](file://database.py#L118-L151)
+- [database.py:603-662](file://database.py#L603-L662)
+- [deliberation.py:121-419](file://deliberation.py#L121-L419)
+- [observer.py:136-172](file://observer.py#L136-L172)
 
 ### 队列管理
 - 列出队列
@@ -336,98 +623,13 @@ Flask-->>Client : "200 JSON"
 - [scientist.py:14-75](file://agents/scientist.py#L14-L75)
 - [director.py:14-124](file://agents/director.py#L14-L124)
 
-### 脑管理API（新增）
-
-#### 认知元素管理
-- 列出认知元素
-  - 方法与路径：GET /ainstein/api/brains/{brain_id}/cognitive-elements
-  - 路径参数：brain_id
-  - 查询参数：type, min_confidence, limit, offset
-  - 响应：{"items":[...], "limit":N, "offset":M}
-  - 状态码：200 OK；400 Bad Request（参数错误）；404 Not Found（大脑不存在）
-- 创建认知元素
-  - 方法与路径：POST /ainstein/api/brains/{brain_id}/cognitive-elements
-  - 路径参数：brain_id
-  - 请求体字段：type, content, payload_json?, confidence?, status?, version?
-  - 响应：认知元素对象
-  - 状态码：201 Created；400 Bad Request；404 Not Found
-- 获取认知元素
-  - 方法与路径：GET /ainstein/api/brains/{brain_id}/cognitive-elements/{ce_id}
-  - 路径参数：brain_id, ce_id
-  - 响应：认知元素对象
-  - 状态码：200 OK；404 Not Found
-- 更新认知元素
-  - 方法与路径：PATCH /ainstein/api/brains/{brain_id}/cognitive-elements/{ce_id}
-  - 路径参数：brain_id, ce_id
-  - 请求体字段：content, payload_json, confidence, confidence_method, status, version, superseded_by, domain_tags
-  - 响应：更新后的认知元素对象
-  - 状态码：200 OK；400 Bad Request；404 Not Found
-- 删除认知元素
-  - 方法与路径：DELETE /ainstein/api/brains/{brain_id}/cognitive-elements/{ce_id}
-  - 路径参数：brain_id, ce_id
-  - 响应：{"status":"deleted"}
-  - 状态码：200 OK；404 Not Found
-
-请求示例（创建认知元素）
-- 方法：POST
-- 路径：/ainstein/api/brains/1/cognitive-elements
-- 请求体：{"type":"hypothesis","content":"AI在教育中的应用可能改变传统教学模式","confidence":0.8,"status":"active"}
-
-响应示例（列出认知元素）
-- 响应体：{"items":[{"id":1,"brain_id":1,"type":"hypothesis","content":"AI在教育中的应用可能改变传统教学模式","confidence":0.8,"status":"active","version":1,"created_at":"YYYY-MM-DD HH:MM:SS"}],"limit":50,"offset":0}
-
-#### 认知关系管理
-- 列出认知关系
-  - 方法与路径：GET /ainstein/api/brains/{brain_id}/cognitive-relations
-  - 路径参数：brain_id
-  - 查询参数：element_id, direction, src_id, dst_id, relation
-  - 响应：{"items":[...]}
-  - 状态码：200 OK；400 Bad Request；404 Not Found
-- 创建认知关系
-  - 方法与路径：POST /ainstein/api/brains/{brain_id}/cognitive-relations
-  - 路径参数：brain_id
-  - 请求体字段：source_id, target_id, relation_type, weight, created_by_agent_id
-  - 响应：关系对象
-  - 状态码：201 Created；400 Bad Request；404 Not Found
-
-请求示例（创建认知关系）
-- 方法：POST
-- 路径：/ainstein/api/brains/1/cognitive-relations
-- 请求体：{"source_id":1,"target_id":2,"relation_type":"supports","weight":0.9,"created_by_agent_id":101}
-
-#### 知识图谱检索
-- 获取知识图谱
-  - 方法与路径：GET /ainstein/api/brains/{brain_id}/knowledge-graph
-  - 路径参数：brain_id
-  - 查询参数：types, limit
-  - 响应：{"nodes":[...],"edges":[...]}
-  - 状态码：200 OK；400 Bad Request；404 Not Found
-
-请求示例（获取知识图谱）
-- 方法：GET
-- 路径：/ainstein/api/brains/1/knowledge-graph?types=hypothesis,fact&limit=200
-
-#### 认知边界获取
-- 获取认知边界
-  - 方法与路径：GET /ainstein/api/brains/{brain_id}/frontier
-  - 路径参数：brain_id
-  - 查询参数：limit, confidence_ceiling
-  - 响应：认知元素数组
-  - 状态码：200 OK；400 Bad Request；404 Not Found
-
-请求示例（获取认知边界）
-- 方法：GET
-- 路径：/ainstein/api/brains/1/frontier?limit=50&confidence_ceiling=0.7
-
-**章节来源**
-- [app.py:183-364](file://app.py#L183-L364)
-- [cognitive.py:1-359](file://cognitive.py#L1-L359)
-- [database.py:603-699](file://database.py#L603-L699)
-
 ## 依赖关系分析
 - 组件耦合
   - Flask路由依赖数据库层进行数据持久化
+  - **新增认证模块**通过auth.py提供JWT令牌验证与用户权限管理
   - **新增认知业务层**通过cognitive.py封装复杂的认知元素和关系逻辑
+  - **新增博弈引擎**通过deliberation.py协调多智能体决策过程
+  - **新增观察员系统**通过observer.py提供上帝视角监控功能
   - Agent层依赖数据库与工具层，引擎层作为执行器
 - 外部依赖
   - LLM服务（DashScope/Anthropic兼容），通过环境变量配置
@@ -438,7 +640,10 @@ Flask-->>Client : "200 JSON"
 ```mermaid
 graph LR
 Flask["Flask路由<br/>app.py"] --> DB["数据库层<br/>database.py"]
+Flask --> Auth["认证模块<br/>auth.py"]
 Flask --> Cog["认知业务层<br/>cognitive.py"]
+Flask --> Delib["博弈引擎<br/>deliberation.py"]
+Flask --> Obs["观察员系统<br/>observer.py"]
 Flask --> AgentSci["科学家Agent<br/>scientist.py"]
 Flask --> AgentDir["主任Agent<br/>director.py"]
 Flask --> AgentRes["研究员Agent<br/>researcher.py"]
@@ -448,13 +653,20 @@ AgentDir --> DB
 AgentRes --> DB
 Engine --> Tools["工具层<br/>data_access.py"]
 Cog --> DB
+Delib --> DB
+Obs --> DB
 WSGI["WSGI入口<br/>wsgi.py"] --> Scheduler["APScheduler"]
 ```
 
 **图表来源**
-- [app.py:43-177](file://app.py#L43-L177)
-- [cognitive.py:1-359](file://cognitive.py#L1-L359)
-- [database.py:101-344](file://database.py#L101-L344)
+- [app.py:69-137](file://app.py#L69-L137)
+- [app.py:507-1050](file://app.py#L507-L1050)
+- [auth.py:196-223](file://auth.py#L196-L223)
+- [cognitive.py:1-325](file://cognitive.py#L1-L325)
+- [deliberation.py:121-419](file://deliberation.py#L121-L419)
+- [observer.py:136-172](file://observer.py#L136-L172)
+- [database.py:118-151](file://database.py#L118-L151)
+- [database.py:603-662](file://database.py#L603-L662)
 - [wsgi.py:27-71](file://wsgi.py#L27-L71)
 - [researcher.py:14-114](file://agents/researcher.py#L14-L114)
 - [scientist.py:14-75](file://agents/scientist.py#L14-L75)
@@ -471,13 +683,17 @@ WSGI["WSGI入口<br/>wsgi.py"] --> Scheduler["APScheduler"]
   - WAL模式与外键开启提升并发与一致性
   - 为关键查询建立索引（队列、会话、发现、记忆、数据集、指令、**认知元素、认知关系**）
   - **新增索引优化**：cognitive_elements(brain_id,type,status,created_at)、cognitive_relations(src_id,dst_id,relation)
+  - **新增索引优化**：brains(owner_user_id,state)、users(username,email)
 - 引擎与工具
   - 三轮引擎限制工具调用轮次，避免LLM对话过长
   - 工具调用按需进行，减少不必要的计算
+  - **新增**：博弈引擎支持并发执行多个博弈实例
 - 并发与异步
   - 会话启动采用线程异步执行，避免阻塞主请求
+  - **新增**：观察员系统采用事件驱动架构，避免轮询开销
 - 前端
   - 前端API封装统一错误处理，便于调试
+  - **新增**：前端自动处理JWT令牌失效，跳转到登录页面
 
 **章节来源**
 - [database.py:113-122](file://database.py#L113-L122)
@@ -485,22 +701,26 @@ WSGI["WSGI入口<br/>wsgi.py"] --> Scheduler["APScheduler"]
 - [app.py:97-104](file://app.py#L97-L104)
 - [three_round.py:105-135](file://engines/three_round.py#L105-L135)
 - [api.ts:3-7](file://frontend/src/api.ts#L3-L7)
+- [observer.py:136-172](file://observer.py#L136-L172)
 
 ## 故障排除指南
 - 常见错误与原因
   - 404 未找到：项目/会话/大脑不存在或路径错误
   - 400 参数错误：缺少文件、请求体格式不正确或参数非法
+  - 401 未认证：JWT令牌缺失或无效
+  - 403 权限不足：普通用户尝试管理员操作
   - 500 内部错误：引擎执行失败或数据库事务回滚
-  - **新增**：认知元素类型非法、关系跨脑创建、置信度过高或过低
+  - **新增**：认知元素类型非法、关系跨脑创建、置信度过高或过低、博弈参与者不足
 - 调试步骤
   - 使用健康检查确认服务可用
   - 检查数据库初始化与Schema是否正确
   - 查看Agent日志定位引擎执行问题
   - 确认LLM API Key与Base URL配置
-  - **新增**：验证认知元素类型列表、检查关系源目标是否属于同一大脑
+  - **新增**：验证JWT令牌签名与有效期、检查认知元素类型列表、确认关系源目标是否属于同一大脑
 - 错误处理
   - 前端统一捕获非OK响应并抛出错误
   - 后端在路由中返回标准JSON错误体
+  - **新增**：认证模块自动清理无效令牌
 
 **章节来源**
 - [app.py:63-65](file://app.py#L63-L65)
@@ -508,23 +728,28 @@ WSGI["WSGI入口<br/>wsgi.py"] --> Scheduler["APScheduler"]
 - [app.py:129-131](file://app.py#L129-L131)
 - [cognitive.py:254-283](file://cognitive.py#L254-L283)
 - [api.ts:3-7](file://frontend/src/api.ts#L3-L7)
+- [auth.py:196-223](file://auth.py#L196-L223)
 
 ## 结论
-本API参考文档提供了AInstein平台各模块的完整接口规范与使用指南，**新增的脑管理API模块**为构建智能体的认知基础设施提供了完整的CRUD、关系管理和知识图谱检索能力。通过明确的HTTP方法、URL模式、请求参数、响应格式与状态码，结合调度器、Agent与引擎的协作机制，开发者可以快速集成与扩展平台能力。建议在生产环境中关注数据库索引、LLM配置与文件存储路径的安全性与可靠性，同时注意新增认知数据的类型约束和关系完整性。
+本API参考文档提供了AInstein平台各模块的完整接口规范与使用指南，**新增的认证、大脑管理、博弈系统、观察员监控模块**为构建智能体的认知基础设施和多智能体决策系统提供了完整的解决方案。通过明确的HTTP方法、URL模式、请求参数、响应格式与状态码，结合JWT认证、事件驱动架构、多智能体博弈引擎和上帝视角监控，开发者可以快速集成与扩展平台能力。建议在生产环境中关注数据库索引、LLM配置与文件存储路径的安全性与可靠性，同时注意新增认知数据的类型约束和关系完整性，以及JWT令牌的安全存储与轮换策略。
 
 ## 附录
 
 ### 认证机制与安全
 - 当前实现
-  - 未内置鉴权中间件，所有接口均为开放访问
+  - **新增**：基于JWT的用户认证系统，支持密码哈希、令牌签发与校验
+  - **新增**：@require_auth和@require_admin装饰器，自动注入当前用户信息
+  - **新增**：用户角色管理（user/admin），管理员可暂停/恢复大脑
 - 安全建议
-  - 在反向代理层启用认证与访问控制
+  - 在反向代理层启用HTTPS与访问控制
   - 限制/ainstein/api的暴露范围，仅允许可信网络访问
   - 为敏感环境变量（如API Key）设置最小权限与轮换策略
   - **新增**：对认知元素和关系的创建操作增加权限验证，防止跨大脑数据访问
+  - **新增**：JWT令牌设置合理过期时间，定期轮换SECRET_KEY
 
 **章节来源**
-- [config.py:6-11](file://config.py#L6-L11)
+- [auth.py:196-223](file://auth.py#L196-L223)
+- [app.py:69-137](file://app.py#L69-L137)
 - [README.md:71-93](file://README.md#L71-L93)
 
 ### API版本管理与向后兼容
@@ -533,13 +758,15 @@ WSGI["WSGI入口<br/>wsgi.py"] --> Scheduler["APScheduler"]
 - 向后兼容
   - 新增字段以可选方式提供，避免破坏既有客户端
   - 保持现有字段语义不变，新增枚举值时在文档中标注
-  - **新增**：脑管理API采用独立的/brains路径，不影响现有接口兼容性
+  - **新增**：认证API采用独立的/auth路径，大脑管理API采用/brains路径，不影响现有接口兼容性
 - 建议
   - 引入/v1前缀并在未来演进中逐步迁移
   - 为重大变更提供弃用时间表与迁移指南
 
 **章节来源**
-- [app.py:43-177](file://app.py#L43-L177)
+- [app.py:69-137](file://app.py#L69-L137)
+- [app.py:190-376](file://app.py#L190-L376)
+- [app.py:507-1050](file://app.py#L507-L1050)
 
 ### 常见使用场景
 - 场景A：创建项目并上传数据集
@@ -551,12 +778,21 @@ WSGI["WSGI入口<br/>wsgi.py"] --> Scheduler["APScheduler"]
 - 场景C：查看发现与队列
   - 步骤：GET /ainstein/api/projects/{pid}/findings -> GET /ainstein/api/projects/{pid}/queue
   - 示例路径：[列出发现:109-114](file://app.py#L109-L114)、[列出队列:71-73](file://app.py#L71-L73)
-- **新增场景D：构建认知图谱**
+- **新增场景D：用户认证与权限管理**
+  - 步骤：POST /ainstein/api/auth/register -> POST /ainstein/api/auth/login -> GET /ainstein/api/auth/me
+  - 示例路径：[用户注册:69-100](file://app.py#L69-L100)、[用户登录:103-130](file://app.py#L103-L130)、[获取当前用户:133-137](file://app.py#L133-L137)
+- **新增场景E：构建认知图谱**
   - 步骤：POST /ainstein/api/brains/{brain_id}/cognitive-elements -> POST /ainstein/api/brains/{brain_id}/cognitive-relations -> GET /ainstein/api/brains/{brain_id}/knowledge-graph
-  - 示例路径：[创建认知元素:216-239](file://app.py#L216-L239)、[创建认知关系:301-323](file://app.py#L301-L323)、[获取知识图谱:326-345](file://app.py#L326-L345)
-- **新增场景E：分析认知边界**
+  - 示例路径：[创建认知元素:543-566](file://app.py#L543-L566)、[创建认知关系:628-652](file://app.py#L628-L652)、[获取知识图谱:653-674](file://app.py#L653-L674)
+- **新增场景F：分析认知边界**
   - 步骤：GET /ainstein/api/brains/{brain_id}/frontier
-  - 示例路径：[获取认知边界:348-359](file://app.py#L348-L359)
+  - 示例路径：[获取认知边界:675-693](file://app.py#L675-L693)
+- **新增场景G：多智能体博弈决策**
+  - 步骤：POST /ainstein/api/brains/{brain_id}/deliberations -> POST /ainstein/api/brains/{brain_id}/deliberations/{delib_id}/run
+  - 示例路径：[发起博弈:694-718](file://app.py#L694-L718)、[运行博弈:826-845](file://app.py#L826-L845)
+- **新增场景H：观察员监控与报告**
+  - 步骤：GET /ainstein/api/brains/{brain_id}/observer-logs/latest -> POST /ainstein/api/brains/{brain_id}/observer-logs/generate
+  - 示例路径：[获取最新日志:943-956](file://app.py#L943-L956)、[生成日志:957-976](file://app.py#L957-L976)
 
 **章节来源**
 - [app.py:54-58](file://app.py#L54-L58)
@@ -564,7 +800,12 @@ WSGI["WSGI入口<br/>wsgi.py"] --> Scheduler["APScheduler"]
 - [app.py:95-104](file://app.py#L95-L104)
 - [app.py:109-114](file://app.py#L109-L114)
 - [app.py:71-73](file://app.py#L71-L73)
-- [app.py:216-239](file://app.py#L216-L239)
-- [app.py:301-323](file://app.py#L301-L323)
-- [app.py:326-345](file://app.py#L326-L345)
-- [app.py:348-359](file://app.py#L348-L359)
+- [app.py:69-137](file://app.py#L69-L137)
+- [app.py:543-566](file://app.py#L543-L566)
+- [app.py:628-652](file://app.py#L628-L652)
+- [app.py:653-674](file://app.py#L653-L674)
+- [app.py:675-693](file://app.py#L675-L693)
+- [app.py:694-718](file://app.py#L694-L718)
+- [app.py:826-845](file://app.py#L826-L845)
+- [app.py:943-956](file://app.py#L943-L956)
+- [app.py:957-976](file://app.py#L957-L976)

@@ -1,8 +1,0 @@
-schema_version: 1
-module_path: backend/agents
-title: 多智能体协作研究引擎
-scope:
-    - agents/
-source_files: []
-depends_on: []
-related_to: []

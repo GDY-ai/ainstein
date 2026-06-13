@@ -1,0 +1,8 @@
+schema_version: 1
+module_path: backend/agents
+title: 硅基大脑多智能体协作框架
+scope:
+    - agents/
+source_files: []
+depends_on: []
+related_to: []

@@ -164,7 +164,7 @@ export default function BrainList() {
                 isAdmin={isAdmin}
                 isOwner={!!user && b.owner_user_id === user.id}
                 actionBusy={actionBusy === b.id}
-                onOpen={() => navigate(`/project/${b.id}`)}
+                onOpen={() => navigate(`/brain/${b.id}`)}
                 onTogglePause={() => togglePause(b)}
               />
             ))}

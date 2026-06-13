@@ -2,19 +2,19 @@
 schema_version: 1
 locale: zh-CN
 branch: master
-exported_at: "2026-06-13T02:09:13Z"
+exported_at: "2026-06-13T03:15:34Z"
 modules:
     "":
-        dir_name: AInstein 智能研究平台
-        title: AInstein 智能研究平台
+        dir_name: 硅基大脑多智能体协作平台
+        title: 硅基大脑多智能体协作平台
         scope: []
         source_files: []
         children: []
         depends_on: []
         related_to: []
     backend:
-        dir_name: 硅基大脑多智能体研究编排核心
-        title: 硅基大脑多智能体研究编排核心
+        dir_name: 硅基大脑多智能体协作平台_2
+        title: 硅基大脑多智能体协作平台
         scope:
             - agents/
             - engines/
@@ -25,14 +25,14 @@ modules:
             - wsgi.py
         source_files: []
         children:
-            - backend/agents
             - backend/tools
+            - backend/agents
         depends_on: []
         related_to:
             - path: frontend
     backend/agents:
-        dir_name: 多智能体协作研究引擎
-        title: 多智能体协作研究引擎
+        dir_name: 硅基大脑多智能体协作框架
+        title: 硅基大脑多智能体协作框架
         scope:
             - agents/
         source_files: []
@@ -49,8 +49,8 @@ modules:
         depends_on: []
         related_to: []
     frontend:
-        dir_name: 爱因思探研究平台前端
-        title: 爱因思探研究平台前端
+        dir_name: 硅基大脑前端应用
+        title: 硅基大脑前端应用
         scope:
             - frontend/
         source_files: []
