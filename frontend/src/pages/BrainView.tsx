@@ -488,36 +488,6 @@ export default function BrainView() {
             </div>
           </div>
         </div>
-        <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', maxWidth: '60%', justifyContent: 'flex-end' }}>
-          {Object.keys(CE_COLORS).map(k => (
-            <span
-              key={k}
-              style={{
-                fontSize: 11,
-                padding: '2px 8px',
-                borderRadius: 999,
-                background: nodeColor(k) + '22',
-                color: nodeColor(k),
-                border: `1px solid ${nodeColor(k)}55`,
-                opacity: stats[k] ? 1 : 0.32,
-                whiteSpace: 'nowrap',
-              }}
-            >
-              <span
-                style={{
-                  display: 'inline-block',
-                  width: 6,
-                  height: 6,
-                  borderRadius: 3,
-                  background: nodeColor(k),
-                  marginRight: 6,
-                  verticalAlign: 'middle',
-                }}
-              />
-              {CE_LABELS[k]} {stats[k] || 0}
-            </span>
-          ))}
-        </div>
       </header>
 
       {error && (
