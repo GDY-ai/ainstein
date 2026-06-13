@@ -87,11 +87,16 @@ _DISPATCH_PER_CYCLE: int = 1
 #: brain_loop 循环内异常时的统一冷静期
 _LOOP_ERROR_COOLDOWN: float = 5.0
 #: 共识收敛阈值 —— synthesizer 产出的 conclusion 置信度 > 该值即自动停止
-_CONVERGENCE_CONFIDENCE_THRESHOLD: float = 0.9
+#: （双轨终止策略·主轨：从 0.9 降到 0.75，使中等置信度的结论也能触发收敛）
+_CONVERGENCE_CONFIDENCE_THRESHOLD: float = 0.75
 #: 触发收敛的角色 key
 _CONVERGENCE_ROLE_KEY: str = "synthesizer"
 #: 触发收敛的 CE 类型
 _CONVERGENCE_CE_TYPE: str = "conclusion"
+#: 双轨终止策略·兜底轨：当 CE 总数达到此阈值时，强制派遣 synthesizer 总结
+_FALLBACK_CE_COUNT: int = 500
+#: 双轨终止策略·兜底轨：当大脑运行时长（秒）达到此阈值时，强制派遣 synthesizer 总结
+_FALLBACK_DURATION_SECONDS: float = 3600.0
 
 
 # ============================================================
@@ -129,6 +134,8 @@ class BrainState:
     last_error: Optional[str] = None
     # 角色级冷却：role_name -> 最近一次该角色思考的时间戳（用于轮转避免单角色霸占）
     last_role_dispatch: Dict[str, float] = field(default_factory=dict)
+    # 双轨终止策略·兜底轨：是否已经触发过强制 synthesizer 总结（避免重复触发）
+    fallback_triggered: bool = False
 
 
 # ============================================================
@@ -505,6 +512,13 @@ class ATAOrchestrator:
                 time.sleep(_LOOP_ERROR_COOLDOWN)
                 continue
 
+            # 双轨终止策略·兜底轨：CE 总数 / 运行时长达到阈值时强制 synthesizer 总结
+            try:
+                if self._check_fallback_trigger(brain_id):
+                    self._force_synthesizer_conclusion(brain_id)
+            except Exception:
+                logger.exception("brain=%s 兜底触发检测异常", brain_id)
+
             # 共识收敛检测：每个 think_cycle 结束后检查一次
             # 若 synthesizer 产出高置信度 conclusion → 自动停止思考
             try:
@@ -577,6 +591,126 @@ class ATAOrchestrator:
             logger.exception("矛盾扫描失败 brain=%s", brain_id)
 
         return activity
+
+    # ============================================================
+    # 双轨终止策略·兜底轨：CE 数量 / 运行时长达阈值 → 强制 synthesizer 总结
+    # ============================================================
+    def _check_fallback_trigger(self, brain_id: int) -> bool:
+        """检查是否应该强制触发 synthesizer 做最终总结。
+
+        条件（任一满足即触发）：
+            1. 该大脑的 CE 总数 ≥ :data:`_FALLBACK_CE_COUNT`
+            2. 该大脑从 ``brains.started_at`` 至今的运行时长
+               ≥ :data:`_FALLBACK_DURATION_SECONDS`
+
+        为避免重复触发，``BrainState.fallback_triggered`` 一旦置为 True 就不再返回 True。
+        服务重启后 BrainState 重建，标志位重置（可接受）。
+
+        :return: True 表示需要强制派遣 synthesizer。
+        """
+        state = self.brains.get(brain_id)
+        if state is None or state.fallback_triggered:
+            return False
+
+        # 条件 1：CE 总数
+        try:
+            with _db.get_db() as conn:
+                row = conn.execute(
+                    "SELECT COUNT(*) AS c FROM cognitive_elements WHERE brain_id=?",
+                    (brain_id,),
+                ).fetchone()
+            ce_count = int(row["c"]) if row is not None else 0
+        except Exception:
+            logger.exception("[fallback-trigger] 查询 CE 总数失败 brain=%s", brain_id)
+            ce_count = 0
+
+        if ce_count >= _FALLBACK_CE_COUNT:
+            logger.info(
+                "[fallback-trigger] brain=%s CE 总数=%d >= %d，触发兜底",
+                brain_id, ce_count, _FALLBACK_CE_COUNT,
+            )
+            return True
+
+        # 条件 2：运行时长（基于内存 started_at；DB 中 brains.started_at 仅作回退）
+        duration = 0.0
+        if state.started_at and state.started_at > 0:
+            duration = time.time() - state.started_at
+        else:
+            try:
+                brain_row = get_brain(brain_id)
+                started_str = brain_row.get("started_at") if brain_row else None
+                if started_str:
+                    # _now_iso() 写入的格式 "%Y-%m-%d %H:%M:%S"（UTC）
+                    started_ts = time.mktime(
+                        time.strptime(started_str, "%Y-%m-%d %H:%M:%S")
+                    ) - time.timezone
+                    duration = time.time() - started_ts
+            except Exception:
+                logger.exception(
+                    "[fallback-trigger] 解析 brains.started_at 失败 brain=%s", brain_id,
+                )
+
+        if duration >= _FALLBACK_DURATION_SECONDS:
+            logger.info(
+                "[fallback-trigger] brain=%s 运行时长=%.1fs >= %.1fs，触发兜底",
+                brain_id, duration, _FALLBACK_DURATION_SECONDS,
+            )
+            return True
+
+        return False
+
+    def _force_synthesizer_conclusion(self, brain_id: int) -> None:
+        """强制派遣 synthesizer 角色产出最终结论 CE。
+
+        仅由 :meth:`_check_fallback_trigger` 命中后调用一次。该方法构造
+        一个伪 SYNTHESIS_REQUIRED 事件，直接交给 synthesizer 的 react_to_event
+        触发其综合性思考；后续是否能收敛交由下一个 think_cycle 的
+        :meth:`_check_convergence` 判断（阈值 0.75）。
+        """
+        state = self.brains.get(brain_id)
+        if state is None:
+            return
+
+        # 标记已触发，避免再次进入
+        with state.state_lock:
+            state.fallback_triggered = True
+
+        synthesizer = self._pick_or_spawn(brain_id, _CONVERGENCE_ROLE_KEY)
+        if synthesizer is None:
+            logger.warning(
+                "[fallback-trigger] brain=%s 无法获取/创建 %s，兜底失败",
+                brain_id, _CONVERGENCE_ROLE_KEY,
+            )
+            return
+
+        pseudo_event: Dict[str, Any] = {
+            "event_id": f"fallback-synth-{brain_id}-{int(time.time())}",
+            "type": "SYNTHESIS_REQUIRED",
+            "brain_id": brain_id,
+            "payload": {
+                "reason": "fallback_trigger",
+                "instruction": (
+                    "请基于目前所有认知元素，综合产出一个最终结论。"
+                    "评估整体证据链的强度，给出你的置信度评分。"
+                ),
+            },
+            "source_agent_id": None,
+        }
+
+        logger.info(
+            "[fallback-trigger] brain=%s 强制派遣 synthesizer[%s] 产出最终 conclusion",
+            brain_id, synthesizer.instance_id,
+        )
+        try:
+            synthesizer.react_to_event(pseudo_event)
+            with state.state_lock:
+                state.last_role_dispatch[synthesizer.role_name] = time.time()
+                state.last_activity = time.time()
+        except Exception:
+            logger.exception(
+                "[fallback-trigger] synthesizer.react_to_event 异常 instance=%s",
+                synthesizer.instance_id,
+            )
 
     # ============================================================
     # 共识收敛检测 & 自动停止
