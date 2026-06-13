@@ -327,7 +327,7 @@ def get_relations(
 def get_knowledge_graph(
     brain_id: int,
     ce_types: Optional[List[str]] = None,
-    limit: int = 200,
+    limit: Optional[int] = None,
 ) -> Dict[str, List[Dict[str, Any]]]:
     """
     获取适配前端力导向图（D3 force / vis-network）的图谱数据。
@@ -343,20 +343,23 @@ def get_knowledge_graph(
         }
 
     ``ce_types`` 不为空时仅返回这些类型的节点；边会自动过滤为两端都在节点集合中的边。
+    ``limit`` 为 None 时返回该大脑全部 CE（SQLite 中 ``LIMIT -1`` 表示无限制）。
     """
+    # SQLite 约定 LIMIT -1 表示不限制行数；这里把 None 透传为 -1
+    effective_limit = -1 if limit is None else max(1, limit)
     if ce_types:
         invalid = [t for t in ce_types if t not in CE_TYPES]
         if invalid:
             raise ValueError(f"非法认知元素类型: {invalid}")
         elements: List[Dict[str, Any]] = []
-        per_type_limit = max(1, limit)
         for t in ce_types:
-            elements.extend(db.get_cognitive_elements(brain_id, type=t, limit=per_type_limit))
+            elements.extend(db.get_cognitive_elements(brain_id, type=t, limit=effective_limit))
     else:
-        elements = db.get_cognitive_elements(brain_id, limit=limit)
+        elements = db.get_cognitive_elements(brain_id, limit=effective_limit)
 
-    # 截断到 limit（防止多类型查询时膨胀）
-    elements = elements[:limit]
+    # 仅在指定了 limit 时截断（防止多类型查询时膨胀）
+    if limit is not None:
+        elements = elements[:limit]
 
     nodes: List[Dict[str, Any]] = []
     node_ids: set = set()

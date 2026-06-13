@@ -147,7 +147,8 @@ export default function BrainView() {
     let alive = true
     async function load() {
       try {
-        const g = await api.getKnowledgeGraph(bid, { limit: 300 })
+        // 一次性加载全部 CE 与 relations；后端无 limit 时返回所有数据
+        const g = await api.getKnowledgeGraph(bid)
         if (!alive) return
         setGraph(g)
         setLastUpdate(new Date())

@@ -657,7 +657,7 @@ def get_knowledge_graph_api(brain_id: int):
 
     Query 参数：
       - ``types``: 逗号分隔的 CE 类型白名单
-      - ``limit``: 节点上限，默认 200
+      - ``limit``: 节点上限；不传则返回该大脑全部 CE 与 relations
     """
     import cognitive
     _, err = _ensure_brain(brain_id)
@@ -665,7 +665,7 @@ def get_knowledge_graph_api(brain_id: int):
         return err
     types_param = request.args.get('types')
     ce_types = [t.strip() for t in types_param.split(',')] if types_param else None
-    limit = request.args.get('limit', default=200, type=int)
+    limit = request.args.get('limit', default=None, type=int)
     try:
         graph = cognitive.get_knowledge_graph(brain_id, ce_types=ce_types, limit=limit)
     except ValueError as e:
