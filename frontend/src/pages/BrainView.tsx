@@ -81,6 +81,7 @@ export default function BrainView() {
   const [isNarrow, setIsNarrow] = useState<boolean>(
     typeof window !== 'undefined' ? window.innerWidth < 1100 : false,
   )
+  const [activeFilters, setActiveFilters] = useState<string[]>([])
 
   // 监听窗口尺寸 → 切换观察员面板的布局（右侧 / 底部折叠）
   useEffect(() => {
@@ -415,6 +416,32 @@ export default function BrainView() {
     })
   }, [selected, graph])
 
+  // ---------- CE 类型筛选高亮 ----------
+  useEffect(() => {
+    if (!svgRef.current) return
+    const svg = d3.select(svgRef.current)
+    const allNodes = svg.selectAll<SVGGElement, GraphNode>('g.node')
+    const allLinks = svg.selectAll<SVGLineElement, GraphLink>('g.links line')
+
+    if (activeFilters.length === 0) {
+      // 无筛选 → 恢复正常（但需尊重 selected 状态，只在无 selected 时恢复）
+      if (!selected) {
+        allNodes.transition().duration(200).attr('opacity', 1)
+        allLinks.transition().duration(200).attr('stroke-opacity', 0.55)
+      }
+      return
+    }
+    // 有筛选 → 按类型设置透明度
+    allNodes.transition().duration(200).attr('opacity', (d: any) =>
+      activeFilters.includes(d.ce_type) ? 1 : 0.15,
+    )
+    allLinks.transition().duration(200).attr('stroke-opacity', (d: any) => {
+      const srcType = (d.source as GraphNode).ce_type
+      const tgtType = (d.target as GraphNode).ce_type
+      return activeFilters.includes(srcType) || activeFilters.includes(tgtType) ? 0.6 : 0.08
+    })
+  }, [activeFilters, graph, selected])
+
   // ---------- 缩放 + 平移 ----------
   useEffect(() => {
     if (!svgRef.current) return
@@ -499,6 +526,47 @@ export default function BrainView() {
 
       <div style={{ flex: 1, position: 'relative', display: 'flex', flexDirection: isNarrow ? 'column' : 'row', minHeight: 0 }}>
         <div ref={containerRef} style={{ flex: '1 1 50%', position: 'relative', background: bgGradient, minHeight: 0, minWidth: 400 }}>
+          {/* CE 类型筛选 toolbar */}
+          <div style={filterBarStyle}>
+            {Object.keys(CE_COLORS).map(k => {
+              const count = stats[k] || 0
+              const isActive = activeFilters.includes(k)
+              const disabled = count === 0
+              return (
+                <button
+                  key={k}
+                  disabled={disabled}
+                  onClick={() => {
+                    if (disabled) return
+                    setActiveFilters(prev =>
+                      prev.includes(k) ? prev.filter(x => x !== k) : [...prev, k],
+                    )
+                  }}
+                  style={{
+                    fontSize: 11,
+                    padding: '3px 8px',
+                    borderRadius: 999,
+                    background: disabled
+                      ? 'rgba(100,116,139,0.1)'
+                      : isActive
+                        ? nodeColor(k) + '55'
+                        : nodeColor(k) + '22',
+                    color: disabled ? '#4a5568' : isActive ? '#fff' : nodeColor(k),
+                    border: isActive
+                      ? `1.5px solid ${nodeColor(k)}`
+                      : '1px solid transparent',
+                    cursor: disabled ? 'default' : 'pointer',
+                    opacity: disabled ? 0.4 : 1,
+                    whiteSpace: 'nowrap',
+                    transition: 'all .15s ease',
+                    lineHeight: 1.4,
+                  }}
+                >
+                  {CE_LABELS[k]} {count}
+                </button>
+              )
+            })}
+          </div>
           <svg ref={svgRef} style={{ width: '100%', height: '100%', display: 'block' }}>
             <defs>
               <marker id="arrow-green" viewBox="0 -5 10 10" refX={20} refY={0} markerWidth={6} markerHeight={6} orient="auto">
@@ -545,15 +613,15 @@ export default function BrainView() {
           </div>
         </div>
 
-        {/* 观察员视角面板 */}
+        {/* 观察员视角面板 — 占满父级高度，内部自滚动 */}
         <div
           style={{
             ...observerWrap,
             flex: isNarrow ? 'none' : '1 1 50%',
             width: isNarrow ? '100%' : 'auto',
-            minWidth: isNarrow ? 'auto' : 450,
-            height: isNarrow ? 'auto' : 'auto',
-            maxHeight: isNarrow ? '50vh' : 'none',
+            minWidth: isNarrow ? 'auto' : 420,
+            height: isNarrow ? '50vh' : '100%',
+            maxHeight: isNarrow ? '50vh' : '100%',
             borderLeft: isNarrow ? 'none' : '1px solid var(--border)',
             borderTop: isNarrow ? '1px solid var(--border)' : 'none',
           }}
@@ -786,6 +854,22 @@ const pulseDot: React.CSSProperties = {
   animation: 'brainPulse 1.6s ease-in-out infinite',
 }
 const bgGradient = `radial-gradient(ellipse at 50% 50%, #1a1d27 0%, #0f1117 70%)`
+const filterBarStyle: React.CSSProperties = {
+  position: 'absolute',
+  top: 12,
+  left: 12,
+  right: 12,
+  zIndex: 5,
+  display: 'flex',
+  flexWrap: 'wrap',
+  gap: 4,
+  padding: '6px 8px',
+  background: 'rgba(15,17,23,0.75)',
+  border: '1px solid var(--border)',
+  borderRadius: 8,
+  backdropFilter: 'blur(8px)',
+  WebkitBackdropFilter: 'blur(8px)',
+}
 const legendStyle: React.CSSProperties = {
   position: 'absolute',
   left: 16,
@@ -834,9 +918,10 @@ const metaStyle: React.CSSProperties = {
 }
 const observerWrap: React.CSSProperties = {
   background: 'rgba(11,13,22,0.4)',
-  padding: 12,
+  padding: 6,
   display: 'flex',
   alignItems: 'stretch',
   overflow: 'hidden',
   minHeight: 0,
+  boxSizing: 'border-box',
 }
