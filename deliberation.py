@@ -89,7 +89,7 @@ class DeliberationResult:
 # ============================================================
 
 #: 默认共识阈值（加权赞成占比 ≥ 此值视为 consensus）
-DEFAULT_CONSENSUS_THRESHOLD: float = 2.0 / 3.0
+DEFAULT_CONSENSUS_THRESHOLD: float = 0.6
 #: 默认多数阈值（加权赞成占比 ≥ 此值且未达共识阈值视为 majority）
 DEFAULT_MAJORITY_THRESHOLD: float = 0.5
 #: 单次博弈最少参与者数（蓝图要求）
