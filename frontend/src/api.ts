@@ -4,6 +4,7 @@ import type {
   BrainFrontier,
   CreateBrainResponse,
   KnowledgeGraph,
+  ObserverLog,
   User,
 } from './types';
 
@@ -174,6 +175,25 @@ export const api = {
     if (params?.confidence_ceiling !== undefined) qs.set('confidence_ceiling', String(params.confidence_ceiling));
     const s = qs.toString();
     return request(`/brains/${brainId}/frontier${s ? `?${s}` : ''}`);
+  },
+
+  // 硅基大脑 · 观察员视角
+  getObserverLogs: async (brainId: number, params?: { kind?: string; limit?: number }) => {
+    const qs = new URLSearchParams();
+    if (params?.kind) qs.set('kind', params.kind);
+    if (params?.limit) qs.set('limit', String(params.limit));
+    const s = qs.toString();
+    return request(`/brains/${brainId}/observer-logs${s ? `?${s}` : ''}`) as Promise<{ items: ObserverLog[]; limit: number; kind: string | null }>;
+  },
+  getLatestObserverLog: async (brainId: number) => {
+    return request(`/brains/${brainId}/observer-logs/latest`) as Promise<ObserverLog | null>;
+  },
+  generateObserverSummary: async (brainId: number, data?: { reason?: string; force?: boolean }) => {
+    return request(`/brains/${brainId}/observer-logs/generate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data || {}),
+    });
   },
 };
 

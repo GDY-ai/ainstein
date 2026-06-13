@@ -5,4 +5,5 @@ scope:
     - tools/
 source_files: []
 depends_on: []
-related_to: []
+related_to:
+    - path: backend/agents

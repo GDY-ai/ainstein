@@ -161,3 +161,27 @@ export interface BrainFrontier {
   low_confidence: CognitiveNode[];
   unsupported: CognitiveNode[];
 }
+
+// ===== 硅基大脑 · 观察员视角 =====
+
+export interface ObserverLogBody {
+  narrative: string;
+  main_directions: string[];
+  key_developments: Array<{ summary: string; cited_ce_ids: number[] }>;
+  deliberation_dynamics?: string;
+  frontier_movement?: string;
+  health_assessment?: string;
+  importance: number;
+}
+
+export interface ObserverLog {
+  id: number;
+  brain_id: number;
+  kind: 'summary' | 'alert' | 'milestone' | string;
+  title: string;
+  body: string;
+  body_struct?: ObserverLogBody;
+  cited_ce_ids: number[];
+  pushed: number;
+  created_at: string;
+}

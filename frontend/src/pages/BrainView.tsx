@@ -3,6 +3,7 @@ import { useParams, useNavigate } from 'react-router-dom'
 import * as d3 from 'd3'
 import { api } from '../api'
 import type { CognitiveNode, KnowledgeGraph } from '../types'
+import ObserverPanel from '../components/ObserverPanel'
 
 // ---------- 类型 ----------
 interface GraphNode extends d3.SimulationNodeDatum, CognitiveNode {
@@ -77,6 +78,18 @@ export default function BrainView() {
   const [hover, setHover] = useState<{ node: CognitiveNode; x: number; y: number } | null>(null)
   const [error, setError] = useState<string>('')
   const [lastUpdate, setLastUpdate] = useState<Date>(new Date())
+  const [isNarrow, setIsNarrow] = useState<boolean>(
+    typeof window !== 'undefined' ? window.innerWidth < 1100 : false,
+  )
+
+  // 监听窗口尺寸 → 切换观察员面板的布局（右侧 / 底部折叠）
+  useEffect(() => {
+    function onResize() {
+      setIsNarrow(window.innerWidth < 1100)
+    }
+    window.addEventListener('resize', onResize)
+    return () => window.removeEventListener('resize', onResize)
+  }, [])
 
   const containerRef = useRef<HTMLDivElement>(null)
   const svgRef = useRef<SVGSVGElement>(null)
@@ -135,6 +148,34 @@ export default function BrainView() {
     merged.forEach(n => newMap.set(n.id, n))
     nodeMapRef.current = newMap
 
+    // 识别种子节点：ce_type === 'question' 且 created_at 最早
+    let seedId: number | null = null
+    let seedEarliest: string | undefined
+    for (const n of merged) {
+      if (n.ce_type !== 'question') continue
+      if (seedEarliest === undefined || (n.created_at && n.created_at < seedEarliest)) {
+        seedId = n.id
+        seedEarliest = n.created_at
+      }
+    }
+
+    // 固定种子节点在画布中央，清理其他被标记过的节点的 fx/fy
+    for (const n of merged) {
+      if (n.id === seedId) {
+        n.fx = w / 2
+        n.fy = h / 2
+        ;(n as any).__seedFixed = true
+      } else if ((n as any).__seedFixed) {
+        n.fx = null
+        n.fy = null
+        ;(n as any).__seedFixed = false
+      }
+    }
+
+    // 种子节点的尺寸/颜色覆盖普通逻辑
+    const getRadius = (d: GraphNode) => (d.id === seedId ? 26 : nodeRadius(d.confidence))
+    const getColor = (d: GraphNode) => (d.id === seedId ? '#FFD700' : nodeColor(d.ce_type))
+
     const links: GraphLink[] = graph.edges
       .filter(e => newMap.has(e.source_id) && newMap.has(e.target_id))
       .map(e => ({
@@ -155,13 +196,18 @@ export default function BrainView() {
         )
         .force('charge', d3.forceManyBody<GraphNode>().strength(-260))
         .force('center', d3.forceCenter(w / 2, h / 2))
-        .force('collision', d3.forceCollide<GraphNode>().radius(d => nodeRadius(d.confidence) + 6))
+        .force('collision', d3.forceCollide<GraphNode>().radius(d => getRadius(d) + 6))
         .force('x', d3.forceX(w / 2).strength(0.04))
         .force('y', d3.forceY(h / 2).strength(0.04))
     } else {
       simRef.current.nodes(merged)
       const lf = simRef.current.force<d3.ForceLink<GraphNode, GraphLink>>('link')
       if (lf) lf.links(links)
+      // 更新 collide 半径，确保新种子节点的更大半径生效
+      simRef.current.force(
+        'collision',
+        d3.forceCollide<GraphNode>().radius(d => getRadius(d) + 6),
+      )
       simRef.current.alpha(0.55).restart()
     }
 
@@ -203,53 +249,72 @@ export default function BrainView() {
         enter => {
           const g = enter
             .append('g')
-            .attr('class', 'node')
+            .attr('class', d => 'node' + (d.id === seedId ? ' seed' : ''))
             .attr('opacity', 0)
             .style('cursor', 'pointer')
           g.append('circle')
-            .attr('class', 'halo')
-            .attr('r', d => nodeRadius(d.confidence) + 8)
-            .attr('fill', d => nodeColor(d.ce_type))
-            .attr('opacity', 0.16)
+            .attr('class', d => 'halo' + (d.id === seedId ? ' seed-halo' : ''))
+            .attr('r', d => getRadius(d) + 8)
+            .attr('fill', d => getColor(d))
+            .attr('opacity', d => (d.id === seedId ? 0.3 : 0.16))
           g.append('circle')
-            .attr('class', 'core')
-            .attr('r', d => nodeRadius(d.confidence))
-            .attr('fill', d => nodeColor(d.ce_type))
-            .attr('stroke', '#0f1117')
-            .attr('stroke-width', 1.5)
+            .attr('class', d => 'core' + (d.id === seedId ? ' seed-core' : ''))
+            .attr('r', d => getRadius(d))
+            .attr('fill', d => getColor(d))
+            .attr('stroke', d => (d.id === seedId ? '#FFE680' : '#0f1117'))
+            .attr('stroke-width', d => (d.id === seedId ? 2 : 1.5))
           g.append('text')
             .attr('text-anchor', 'middle')
-            .attr('dy', d => nodeRadius(d.confidence) + 14)
-            .attr('fill', '#cbd5e1')
-            .attr('font-size', 11)
+            .attr('dy', d => getRadius(d) + 14)
+            .attr('fill', d => (d.id === seedId ? '#FFD700' : '#cbd5e1'))
+            .attr('font-size', d => (d.id === seedId ? 12 : 11))
+            .attr('font-weight', d => (d.id === seedId ? 600 : 400))
             .attr('pointer-events', 'none')
-            .text(d => (d.title?.length > 14 ? d.title.slice(0, 14) + '…' : d.title))
+            .text(d => {
+              const prefix = d.id === seedId ? '◆ ' : ''
+              const t = d.title || ''
+              return prefix + (t.length > 14 ? t.slice(0, 14) + '…' : t)
+            })
           // 入场动画：从 0 透明 + 半径放大
           g.transition().duration(900).attr('opacity', 1)
           g.select<SVGCircleElement>('circle.halo')
             .attr('r', 0)
             .transition()
             .duration(900)
-            .attr('r', d => nodeRadius(d.confidence) + 8)
+            .attr('r', d => getRadius(d) + 8)
           return g
         },
         update => {
+          // 切换 seed class（极端情况：种子节点变更）
+          update.attr('class', d => 'node' + (d.id === seedId ? ' seed' : ''))
           update
             .select<SVGCircleElement>('circle.core')
+            .attr('class', d => 'core' + (d.id === seedId ? ' seed-core' : ''))
+            .attr('stroke', d => (d.id === seedId ? '#FFE680' : '#0f1117'))
+            .attr('stroke-width', d => (d.id === seedId ? 2 : 1.5))
             .transition()
             .duration(400)
-            .attr('r', d => nodeRadius(d.confidence))
-            .attr('fill', d => nodeColor(d.ce_type))
+            .attr('r', d => getRadius(d))
+            .attr('fill', d => getColor(d))
           update
             .select<SVGCircleElement>('circle.halo')
+            .attr('class', d => 'halo' + (d.id === seedId ? ' seed-halo' : ''))
+            .attr('opacity', d => (d.id === seedId ? 0.3 : 0.16))
             .transition()
             .duration(400)
-            .attr('r', d => nodeRadius(d.confidence) + 8)
-            .attr('fill', d => nodeColor(d.ce_type))
+            .attr('r', d => getRadius(d) + 8)
+            .attr('fill', d => getColor(d))
           update
             .select<SVGTextElement>('text')
-            .text(d => (d.title?.length > 14 ? d.title.slice(0, 14) + '…' : d.title))
-            .attr('dy', d => nodeRadius(d.confidence) + 14)
+            .attr('fill', d => (d.id === seedId ? '#FFD700' : '#cbd5e1'))
+            .attr('font-size', d => (d.id === seedId ? 12 : 11))
+            .attr('font-weight', d => (d.id === seedId ? 600 : 400))
+            .text(d => {
+              const prefix = d.id === seedId ? '◆ ' : ''
+              const t = d.title || ''
+              return prefix + (t.length > 14 ? t.slice(0, 14) + '…' : t)
+            })
+            .attr('dy', d => getRadius(d) + 14)
           return update
         },
         exit => exit.transition().duration(400).attr('opacity', 0).remove(),
@@ -315,7 +380,11 @@ export default function BrainView() {
     const allLinks = svg.selectAll<SVGLineElement, GraphLink>('g.links line')
     if (!selected) {
       allNodes.transition().duration(200).attr('opacity', 1)
-      allNodes.select('circle.core').attr('stroke', '#0f1117').attr('stroke-width', 1.5)
+      allNodes.select<SVGCircleElement>('circle.core').each(function () {
+        const sel = d3.select(this)
+        const isSeed = sel.classed('seed-core')
+        sel.attr('stroke', isSeed ? '#FFE680' : '#0f1117').attr('stroke-width', isSeed ? 2 : 1.5)
+      })
       allLinks.transition().duration(200).attr('stroke-opacity', 0.55)
       return
     }
@@ -329,9 +398,16 @@ export default function BrainView() {
     })
     allNodes.transition().duration(200).attr('opacity', d => (connected.has(d.id) ? 1 : 0.12))
     allNodes
-      .select('circle.core')
-      .attr('stroke', d => (d.id === id ? '#fff' : '#0f1117'))
-      .attr('stroke-width', d => (d.id === id ? 2.5 : 1.5))
+      .select<SVGCircleElement>('circle.core')
+      .each(function (d) {
+        const sel = d3.select(this)
+        const isSeed = sel.classed('seed-core')
+        if (d.id === id) {
+          sel.attr('stroke', '#fff').attr('stroke-width', 2.5)
+        } else {
+          sel.attr('stroke', isSeed ? '#FFE680' : '#0f1117').attr('stroke-width', isSeed ? 2 : 1.5)
+        }
+      })
     allLinks.transition().duration(200).attr('stroke-opacity', d => {
       const s = (d.source as GraphNode).id
       const t = (d.target as GraphNode).id
@@ -421,8 +497,8 @@ export default function BrainView() {
         <div style={{ padding: '6px 24px', background: '#ef444422', color: '#ef4444', fontSize: 12 }}>{error}</div>
       )}
 
-      <div style={{ flex: 1, position: 'relative', display: 'flex', minHeight: 0 }}>
-        <div ref={containerRef} style={{ flex: 1, position: 'relative', background: bgGradient }}>
+      <div style={{ flex: 1, position: 'relative', display: 'flex', flexDirection: isNarrow ? 'column' : 'row', minHeight: 0 }}>
+        <div ref={containerRef} style={{ flex: 1, position: 'relative', background: bgGradient, minHeight: 0 }}>
           <svg ref={svgRef} style={{ width: '100%', height: '100%', display: 'block' }}>
             <defs>
               <marker id="arrow-green" viewBox="0 -5 10 10" refX={20} refY={0} markerWidth={6} markerHeight={6} orient="auto">
@@ -467,6 +543,21 @@ export default function BrainView() {
               滚轮缩放 · 拖动节点 · 点击高亮
             </div>
           </div>
+        </div>
+
+        {/* 观察员视角面板 */}
+        <div
+          style={{
+            ...observerWrap,
+            width: isNarrow ? '100%' : 380,
+            height: isNarrow ? 'auto' : 'auto',
+            maxHeight: isNarrow ? '50vh' : 'none',
+            borderLeft: isNarrow ? 'none' : '1px solid var(--border)',
+            borderTop: isNarrow ? '1px solid var(--border)' : 'none',
+          }}
+          onClick={e => e.stopPropagation()}
+        >
+          <ObserverPanel brainId={bid} defaultOpen={!isNarrow} />
         </div>
 
         {selected && (
@@ -558,6 +649,24 @@ export default function BrainView() {
 
       <style>{`
         @keyframes brainPulse { 0%, 100% { opacity: 0.55; transform: scale(1); } 50% { opacity: 1; transform: scale(1.25); } }
+        @keyframes seedCorePulse {
+          0%, 100% { filter: drop-shadow(0 0 6px #FFD700) drop-shadow(0 0 2px #FFA500); }
+          50%      { filter: drop-shadow(0 0 18px #FFB300) drop-shadow(0 0 6px #FF8C00); }
+        }
+        @keyframes seedHaloPulse {
+          0%, 100% { opacity: 0.25; transform: scale(1); }
+          50%      { opacity: 0.55; transform: scale(1.18); }
+        }
+        circle.seed-core {
+          animation: seedCorePulse 2.4s ease-in-out infinite;
+          transform-box: fill-box;
+          transform-origin: center;
+        }
+        circle.seed-halo {
+          animation: seedHaloPulse 2.4s ease-in-out infinite;
+          transform-box: fill-box;
+          transform-origin: center;
+        }
       `}</style>
     </div>
   )
@@ -720,4 +829,13 @@ const metaStyle: React.CSSProperties = {
   maxHeight: 160,
   whiteSpace: 'pre-wrap',
   wordBreak: 'break-all',
+}
+const observerWrap: React.CSSProperties = {
+  flexShrink: 0,
+  background: 'rgba(11,13,22,0.4)',
+  padding: 12,
+  display: 'flex',
+  alignItems: 'stretch',
+  overflow: 'hidden',
+  minHeight: 0,
 }

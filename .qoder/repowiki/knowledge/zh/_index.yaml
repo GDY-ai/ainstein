@@ -2,18 +2,18 @@
 schema_version: 1
 locale: zh-CN
 branch: master
-exported_at: "2026-06-13T03:15:34Z"
+exported_at: "2026-06-13T05:02:42Z"
 modules:
     "":
-        dir_name: 硅基大脑多智能体协作平台
-        title: 硅基大脑多智能体协作平台
+        dir_name: 硅基大脑多智能体协作系统
+        title: 硅基大脑多智能体协作系统
         scope: []
         source_files: []
         children: []
         depends_on: []
         related_to: []
     backend:
-        dir_name: 硅基大脑多智能体协作平台_2
+        dir_name: 硅基大脑多智能体协作平台
         title: 硅基大脑多智能体协作平台
         scope:
             - agents/
@@ -25,20 +25,21 @@ modules:
             - wsgi.py
         source_files: []
         children:
-            - backend/tools
             - backend/agents
+            - backend/tools
         depends_on: []
         related_to:
             - path: frontend
     backend/agents:
-        dir_name: 硅基大脑多智能体协作框架
-        title: 硅基大脑多智能体协作框架
+        dir_name: 多角色智能体框架与科研协作引擎
+        title: 多角色智能体框架与科研协作引擎
         scope:
             - agents/
         source_files: []
         children: []
         depends_on: []
-        related_to: []
+        related_to:
+            - path: backend/tools
     backend/tools:
         dir_name: 工具注册与执行引擎
         title: 工具注册与执行引擎
@@ -47,10 +48,11 @@ modules:
         source_files: []
         children: []
         depends_on: []
-        related_to: []
+        related_to:
+            - path: backend/agents
     frontend:
-        dir_name: 硅基大脑前端应用
-        title: 硅基大脑前端应用
+        dir_name: 硅基大脑前端控制台
+        title: 硅基大脑前端控制台
         scope:
             - frontend/
         source_files: []

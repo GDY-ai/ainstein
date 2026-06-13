@@ -1,6 +1,6 @@
 schema_version: 1
 module_path: frontend
-title: 硅基大脑前端应用
+title: 硅基大脑前端控制台
 scope:
     - frontend/
 source_files: []
