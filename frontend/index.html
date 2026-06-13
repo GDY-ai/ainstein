@@ -12,6 +12,18 @@
       --text: #e4e6ed; --text2: #8b8fa3; --accent: #6366f1; --accent2: #818cf8;
       --green: #22c55e; --yellow: #eab308; --red: #ef4444; --blue: #3b82f6;
     }
+    @keyframes ainstein-pulse {
+      0%   { transform: scale(0.6); opacity: 0.9; }
+      100% { transform: scale(2.4); opacity: 0; }
+    }
+    @keyframes ainstein-spin {
+      0%   { transform: rotate(0deg); }
+      100% { transform: rotate(360deg); }
+    }
+    @keyframes ainstein-fade-in {
+      0%   { opacity: 0; transform: translateY(8px); }
+      100% { opacity: 1; transform: translateY(0); }
+    }
   </style>
 </head>
 <body>

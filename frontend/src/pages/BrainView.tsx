@@ -1,0 +1,723 @@
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { useParams, useNavigate } from 'react-router-dom'
+import * as d3 from 'd3'
+import { api } from '../api'
+import type { CognitiveNode, KnowledgeGraph } from '../types'
+
+// ---------- 类型 ----------
+interface GraphNode extends d3.SimulationNodeDatum, CognitiveNode {
+  __entered?: boolean
+}
+
+interface GraphLink extends d3.SimulationLinkDatum<GraphNode> {
+  id: number
+  source: number | GraphNode
+  target: number | GraphNode
+  relation_type: string
+  weight: number
+}
+
+// ---------- CE 类型映射 ----------
+const CE_COLORS: Record<string, string> = {
+  observation: '#64748b',
+  question: '#f59e0b',
+  hypothesis: '#8b5cf6',
+  evidence: '#22c55e',
+  counter_evidence: '#ef4444',
+  inference: '#06b6d4',
+  argument: '#3b82f6',
+  conclusion: '#10b981',
+  perspective: '#ec4899',
+  insight: '#f97316',
+  consensus: '#fbbf24',
+  dissent: '#dc2626',
+}
+
+const CE_LABELS: Record<string, string> = {
+  observation: '观察',
+  question: '问题',
+  hypothesis: '假设',
+  evidence: '证据',
+  counter_evidence: '反证',
+  inference: '推论',
+  argument: '论证',
+  conclusion: '结论',
+  perspective: '视角',
+  insight: '洞察',
+  consensus: '共识',
+  dissent: '异见',
+}
+
+const REL_LABELS: Record<string, string> = {
+  supports: '支持',
+  refutes: '反驳',
+  derives_from: '推导自',
+  contradicts: '矛盾',
+  related_to: '关联',
+  answers: '回答',
+}
+
+const nodeColor = (t: string) => CE_COLORS[t] || '#64748b'
+const nodeRadius = (c: number) => 8 + 24 * Math.max(0, Math.min(1, c || 0))
+
+function edgeStyle(t: string) {
+  if (t === 'supports' || t === 'derives_from') return { color: '#22c55e', dash: '', marker: 'green' }
+  if (t === 'refutes' || t === 'contradicts') return { color: '#ef4444', dash: '6,4', marker: 'red' }
+  return { color: '#5b6175', dash: '', marker: 'gray' }
+}
+
+// ---------- 主组件 ----------
+export default function BrainView() {
+  const { brainId } = useParams()
+  const bid = Number(brainId)
+  const navigate = useNavigate()
+
+  const [graph, setGraph] = useState<KnowledgeGraph>({ nodes: [], edges: [] })
+  const [selected, setSelected] = useState<CognitiveNode | null>(null)
+  const [hover, setHover] = useState<{ node: CognitiveNode; x: number; y: number } | null>(null)
+  const [error, setError] = useState<string>('')
+  const [lastUpdate, setLastUpdate] = useState<Date>(new Date())
+
+  const containerRef = useRef<HTMLDivElement>(null)
+  const svgRef = useRef<SVGSVGElement>(null)
+  const simRef = useRef<d3.Simulation<GraphNode, GraphLink> | null>(null)
+  const nodeMapRef = useRef<Map<number, GraphNode>>(new Map())
+
+  // ---------- 拉取数据（每 10 秒轮询） ----------
+  useEffect(() => {
+    if (!bid || Number.isNaN(bid)) return
+    let alive = true
+    async function load() {
+      try {
+        const g = await api.getKnowledgeGraph(bid, { limit: 300 })
+        if (!alive) return
+        setGraph(g)
+        setLastUpdate(new Date())
+        setError('')
+      } catch (e: any) {
+        if (alive) setError(e?.message || '加载失败')
+      }
+    }
+    load()
+    const t = setInterval(load, 10000)
+    return () => { alive = false; clearInterval(t) }
+  }, [bid])
+
+  // ---------- 节点统计 ----------
+  const stats = useMemo(() => {
+    const m: Record<string, number> = {}
+    for (const n of graph.nodes) m[n.ce_type] = (m[n.ce_type] || 0) + 1
+    return m
+  }, [graph.nodes])
+
+  // ---------- D3 渲染 ----------
+  useEffect(() => {
+    if (!svgRef.current || !containerRef.current) return
+    const w = containerRef.current.clientWidth
+    const h = containerRef.current.clientHeight
+
+    // 合并节点：保留旧节点的 x/y/vx/vy，把新内容回填
+    const merged: GraphNode[] = graph.nodes.map(n => {
+      const old = nodeMapRef.current.get(n.id)
+      if (old) {
+        Object.assign(old, n)
+        return old
+      }
+      const fresh: GraphNode = {
+        ...n,
+        x: w / 2 + (Math.random() - 0.5) * 120,
+        y: h / 2 + (Math.random() - 0.5) * 120,
+        __entered: false,
+      }
+      return fresh
+    })
+    const newMap = new Map<number, GraphNode>()
+    merged.forEach(n => newMap.set(n.id, n))
+    nodeMapRef.current = newMap
+
+    const links: GraphLink[] = graph.edges
+      .filter(e => newMap.has(e.source_id) && newMap.has(e.target_id))
+      .map(e => ({
+        id: e.id,
+        source: newMap.get(e.source_id)!,
+        target: newMap.get(e.target_id)!,
+        relation_type: e.relation_type,
+        weight: e.weight,
+      }))
+
+    // 创建/更新 simulation
+    if (!simRef.current) {
+      simRef.current = d3
+        .forceSimulation<GraphNode, GraphLink>(merged)
+        .force(
+          'link',
+          d3.forceLink<GraphNode, GraphLink>(links).id(d => d.id).distance(d => 90 + 30 / Math.max(0.4, d.weight)).strength(0.45),
+        )
+        .force('charge', d3.forceManyBody<GraphNode>().strength(-260))
+        .force('center', d3.forceCenter(w / 2, h / 2))
+        .force('collision', d3.forceCollide<GraphNode>().radius(d => nodeRadius(d.confidence) + 6))
+        .force('x', d3.forceX(w / 2).strength(0.04))
+        .force('y', d3.forceY(h / 2).strength(0.04))
+    } else {
+      simRef.current.nodes(merged)
+      const lf = simRef.current.force<d3.ForceLink<GraphNode, GraphLink>>('link')
+      if (lf) lf.links(links)
+      simRef.current.alpha(0.55).restart()
+    }
+
+    // ---------- SVG 选择与 join ----------
+    const svg = d3.select(svgRef.current)
+    svg.attr('viewBox', `0 0 ${w} ${h}`)
+    const gRoot = svg.select<SVGGElement>('g.viewport')
+
+    // links
+    gRoot
+      .select<SVGGElement>('g.links')
+      .selectAll<SVGLineElement, GraphLink>('line')
+      .data(links, (d: any) => d.id)
+      .join(
+        enter =>
+          enter
+            .append('line')
+            .attr('stroke', d => edgeStyle(d.relation_type).color)
+            .attr('stroke-dasharray', d => edgeStyle(d.relation_type).dash)
+            .attr('stroke-width', d => 1 + Math.min(3, d.weight || 1))
+            .attr('stroke-opacity', 0)
+            .attr('marker-end', d => `url(#arrow-${edgeStyle(d.relation_type).marker})`)
+            .call(s => s.transition().duration(700).attr('stroke-opacity', 0.55)),
+        update =>
+          update
+            .attr('stroke', d => edgeStyle(d.relation_type).color)
+            .attr('stroke-dasharray', d => edgeStyle(d.relation_type).dash)
+            .attr('stroke-width', d => 1 + Math.min(3, d.weight || 1))
+            .attr('marker-end', d => `url(#arrow-${edgeStyle(d.relation_type).marker})`),
+        exit => exit.transition().duration(400).attr('stroke-opacity', 0).remove(),
+      )
+
+    // nodes
+    const nodeSel = gRoot
+      .select<SVGGElement>('g.nodes')
+      .selectAll<SVGGElement, GraphNode>('g.node')
+      .data(merged, (d: any) => d.id)
+      .join(
+        enter => {
+          const g = enter
+            .append('g')
+            .attr('class', 'node')
+            .attr('opacity', 0)
+            .style('cursor', 'pointer')
+          g.append('circle')
+            .attr('class', 'halo')
+            .attr('r', d => nodeRadius(d.confidence) + 8)
+            .attr('fill', d => nodeColor(d.ce_type))
+            .attr('opacity', 0.16)
+          g.append('circle')
+            .attr('class', 'core')
+            .attr('r', d => nodeRadius(d.confidence))
+            .attr('fill', d => nodeColor(d.ce_type))
+            .attr('stroke', '#0f1117')
+            .attr('stroke-width', 1.5)
+          g.append('text')
+            .attr('text-anchor', 'middle')
+            .attr('dy', d => nodeRadius(d.confidence) + 14)
+            .attr('fill', '#cbd5e1')
+            .attr('font-size', 11)
+            .attr('pointer-events', 'none')
+            .text(d => (d.title?.length > 14 ? d.title.slice(0, 14) + '…' : d.title))
+          // 入场动画：从 0 透明 + 半径放大
+          g.transition().duration(900).attr('opacity', 1)
+          g.select<SVGCircleElement>('circle.halo')
+            .attr('r', 0)
+            .transition()
+            .duration(900)
+            .attr('r', d => nodeRadius(d.confidence) + 8)
+          return g
+        },
+        update => {
+          update
+            .select<SVGCircleElement>('circle.core')
+            .transition()
+            .duration(400)
+            .attr('r', d => nodeRadius(d.confidence))
+            .attr('fill', d => nodeColor(d.ce_type))
+          update
+            .select<SVGCircleElement>('circle.halo')
+            .transition()
+            .duration(400)
+            .attr('r', d => nodeRadius(d.confidence) + 8)
+            .attr('fill', d => nodeColor(d.ce_type))
+          update
+            .select<SVGTextElement>('text')
+            .text(d => (d.title?.length > 14 ? d.title.slice(0, 14) + '…' : d.title))
+            .attr('dy', d => nodeRadius(d.confidence) + 14)
+          return update
+        },
+        exit => exit.transition().duration(400).attr('opacity', 0).remove(),
+      )
+
+    // 拖拽
+    const drag = d3
+      .drag<SVGGElement, GraphNode>()
+      .on('start', (event, d) => {
+        if (!event.active) simRef.current?.alphaTarget(0.3).restart()
+        d.fx = d.x
+        d.fy = d.y
+      })
+      .on('drag', (event, d) => {
+        d.fx = event.x
+        d.fy = event.y
+      })
+      .on('end', (event, d) => {
+        if (!event.active) simRef.current?.alphaTarget(0)
+        d.fx = null
+        d.fy = null
+      })
+    nodeSel.call(drag as any)
+
+    // 悬停 / 点击
+    nodeSel
+      .on('mouseenter', function (event: MouseEvent, d) {
+        setHover({ node: d, x: event.clientX, y: event.clientY })
+      })
+      .on('mousemove', function (event: MouseEvent, d) {
+        setHover({ node: d, x: event.clientX, y: event.clientY })
+      })
+      .on('mouseleave', function () {
+        setHover(null)
+      })
+      .on('click', function (event: MouseEvent, d) {
+        event.stopPropagation()
+        setSelected(prev => (prev && prev.id === d.id ? null : d))
+      })
+
+    // tick
+    simRef.current.on('tick', () => {
+      gRoot
+        .select('g.links')
+        .selectAll<SVGLineElement, GraphLink>('line')
+        .attr('x1', d => (d.source as GraphNode).x!)
+        .attr('y1', d => (d.source as GraphNode).y!)
+        .attr('x2', d => (d.target as GraphNode).x!)
+        .attr('y2', d => (d.target as GraphNode).y!)
+      nodeSel.attr('transform', d => `translate(${d.x},${d.y})`)
+    })
+
+    return () => {
+      simRef.current?.on('tick', null)
+    }
+  }, [graph])
+
+  // ---------- 选中节点高亮 ----------
+  useEffect(() => {
+    if (!svgRef.current) return
+    const svg = d3.select(svgRef.current)
+    const allNodes = svg.selectAll<SVGGElement, GraphNode>('g.node')
+    const allLinks = svg.selectAll<SVGLineElement, GraphLink>('g.links line')
+    if (!selected) {
+      allNodes.transition().duration(200).attr('opacity', 1)
+      allNodes.select('circle.core').attr('stroke', '#0f1117').attr('stroke-width', 1.5)
+      allLinks.transition().duration(200).attr('stroke-opacity', 0.55)
+      return
+    }
+    const id = selected.id
+    const connected = new Set<number>([id])
+    allLinks.each(function (d) {
+      const s = (d.source as GraphNode).id
+      const t = (d.target as GraphNode).id
+      if (s === id) connected.add(t)
+      if (t === id) connected.add(s)
+    })
+    allNodes.transition().duration(200).attr('opacity', d => (connected.has(d.id) ? 1 : 0.12))
+    allNodes
+      .select('circle.core')
+      .attr('stroke', d => (d.id === id ? '#fff' : '#0f1117'))
+      .attr('stroke-width', d => (d.id === id ? 2.5 : 1.5))
+    allLinks.transition().duration(200).attr('stroke-opacity', d => {
+      const s = (d.source as GraphNode).id
+      const t = (d.target as GraphNode).id
+      return s === id || t === id ? 0.95 : 0.04
+    })
+  }, [selected, graph])
+
+  // ---------- 缩放 + 平移 ----------
+  useEffect(() => {
+    if (!svgRef.current) return
+    const svg = d3.select(svgRef.current)
+    const gRoot = svg.select<SVGGElement>('g.viewport')
+    const zoom = d3
+      .zoom<SVGSVGElement, unknown>()
+      .scaleExtent([0.25, 4])
+      .filter((event: any) => {
+        // 不让节点拖拽触发画布平移
+        if (event.button) return false
+        const target = event.target as Element
+        if (target && target.closest('g.node')) return false
+        return true
+      })
+      .on('zoom', event => {
+        gRoot.attr('transform', event.transform.toString())
+      })
+    svg.call(zoom as any)
+    // 点击空白取消选中
+    svg.on('click', () => setSelected(null))
+    return () => {
+      svg.on('.zoom', null)
+      svg.on('click', null)
+    }
+  }, [])
+
+  // ---------- 渲染 ----------
+  return (
+    <div style={pageStyle}>
+      <header style={headerStyle}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
+          <button onClick={() => navigate('/')} style={backBtn}>
+            &larr; 返回
+          </button>
+          <div>
+            <div style={{ display: 'flex', alignItems: 'baseline', gap: 12 }}>
+              <span style={{ fontSize: 11, color: 'var(--text2)', letterSpacing: 3 }}>SILICON · BRAIN</span>
+              <h1 style={{ fontSize: 20, color: 'var(--accent2)', margin: 0 }}>大脑 #{bid}</h1>
+              <span style={pulseDot} title="实时同步中" />
+            </div>
+            <div style={{ fontSize: 12, color: 'var(--text2)', marginTop: 2 }}>
+              {graph.nodes.length} 个认知元素 · {graph.edges.length} 条关系 · 上次同步 {lastUpdate.toLocaleTimeString()}
+            </div>
+          </div>
+        </div>
+        <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', maxWidth: '60%', justifyContent: 'flex-end' }}>
+          {Object.keys(CE_COLORS).map(k => (
+            <span
+              key={k}
+              style={{
+                fontSize: 11,
+                padding: '2px 8px',
+                borderRadius: 999,
+                background: nodeColor(k) + '22',
+                color: nodeColor(k),
+                border: `1px solid ${nodeColor(k)}55`,
+                opacity: stats[k] ? 1 : 0.32,
+                whiteSpace: 'nowrap',
+              }}
+            >
+              <span
+                style={{
+                  display: 'inline-block',
+                  width: 6,
+                  height: 6,
+                  borderRadius: 3,
+                  background: nodeColor(k),
+                  marginRight: 6,
+                  verticalAlign: 'middle',
+                }}
+              />
+              {CE_LABELS[k]} {stats[k] || 0}
+            </span>
+          ))}
+        </div>
+      </header>
+
+      {error && (
+        <div style={{ padding: '6px 24px', background: '#ef444422', color: '#ef4444', fontSize: 12 }}>{error}</div>
+      )}
+
+      <div style={{ flex: 1, position: 'relative', display: 'flex', minHeight: 0 }}>
+        <div ref={containerRef} style={{ flex: 1, position: 'relative', background: bgGradient }}>
+          <svg ref={svgRef} style={{ width: '100%', height: '100%', display: 'block' }}>
+            <defs>
+              <marker id="arrow-green" viewBox="0 -5 10 10" refX={20} refY={0} markerWidth={6} markerHeight={6} orient="auto">
+                <path d="M0,-5L10,0L0,5" fill="#22c55e" />
+              </marker>
+              <marker id="arrow-red" viewBox="0 -5 10 10" refX={20} refY={0} markerWidth={6} markerHeight={6} orient="auto">
+                <path d="M0,-5L10,0L0,5" fill="#ef4444" />
+              </marker>
+              <marker id="arrow-gray" viewBox="0 -5 10 10" refX={20} refY={0} markerWidth={6} markerHeight={6} orient="auto">
+                <path d="M0,-5L10,0L0,5" fill="#5b6175" />
+              </marker>
+              <radialGradient id="vignette" cx="50%" cy="50%" r="60%">
+                <stop offset="0%" stopColor="#1a1d27" stopOpacity={0} />
+                <stop offset="100%" stopColor="#0f1117" stopOpacity={0.85} />
+              </radialGradient>
+              <pattern id="grid" width={40} height={40} patternUnits="userSpaceOnUse">
+                <path d="M 40 0 L 0 0 0 40" fill="none" stroke="#1f2333" strokeWidth={0.5} />
+              </pattern>
+            </defs>
+            <rect x={0} y={0} width="100%" height="100%" fill="url(#grid)" pointerEvents="none" />
+            <rect x={0} y={0} width="100%" height="100%" fill="url(#vignette)" pointerEvents="none" />
+            <g className="viewport">
+              <g className="links" />
+              <g className="nodes" />
+            </g>
+          </svg>
+
+          {graph.nodes.length === 0 && !error && (
+            <div style={emptyStyle}>
+              <div style={{ fontSize: 12, color: 'var(--text2)', letterSpacing: 2, marginBottom: 8 }}>STANDBY</div>
+              <div style={{ color: 'var(--text)' }}>大脑尚未产生任何认知元素</div>
+              <div style={{ fontSize: 12, color: 'var(--text2)', marginTop: 6 }}>等待思考触发…</div>
+            </div>
+          )}
+
+          <div style={legendStyle}>
+            <div style={{ fontSize: 10, color: 'var(--text2)', marginBottom: 4, letterSpacing: 1 }}>关系</div>
+            <LegendLine color="#22c55e" label="支持 / 推导" />
+            <LegendLine color="#ef4444" label="反驳 / 矛盾" dashed />
+            <LegendLine color="#5b6175" label="其它关联" />
+            <div style={{ fontSize: 10, color: 'var(--text2)', marginTop: 8, lineHeight: 1.6 }}>
+              滚轮缩放 · 拖动节点 · 点击高亮
+            </div>
+          </div>
+        </div>
+
+        {selected && (
+          <aside style={panelStyle} onClick={e => e.stopPropagation()}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 14 }}>
+              <span
+                style={{
+                  fontSize: 11,
+                  padding: '3px 10px',
+                  borderRadius: 4,
+                  background: nodeColor(selected.ce_type) + '22',
+                  color: nodeColor(selected.ce_type),
+                  letterSpacing: 1,
+                  textTransform: 'uppercase',
+                }}
+              >
+                {CE_LABELS[selected.ce_type] || selected.ce_type}
+              </span>
+              <button onClick={() => setSelected(null)} style={closeBtn}>×</button>
+            </div>
+            <h3 style={{ color: 'var(--text)', fontSize: 16, marginBottom: 8, lineHeight: 1.4 }}>{selected.title}</h3>
+
+            <div style={{ margin: '12px 0' }}>
+              <div style={{ fontSize: 10, color: 'var(--text2)', letterSpacing: 1, marginBottom: 4 }}>
+                CONFIDENCE · {(selected.confidence * 100).toFixed(0)}%
+              </div>
+              <div style={{ height: 4, background: 'var(--bg3)', borderRadius: 2, overflow: 'hidden' }}>
+                <div
+                  style={{
+                    width: `${Math.max(0, Math.min(1, selected.confidence)) * 100}%`,
+                    height: '100%',
+                    background: nodeColor(selected.ce_type),
+                    transition: 'width .4s ease',
+                  }}
+                />
+              </div>
+            </div>
+
+            <p style={{ color: 'var(--text2)', fontSize: 13, lineHeight: 1.6, whiteSpace: 'pre-wrap' }}>
+              {selected.content}
+            </p>
+
+            <div style={{ marginTop: 14, fontSize: 11, color: 'var(--text2)', display: 'flex', justifyContent: 'space-between' }}>
+              <span>状态：{selected.status}</span>
+              <span>{selected.created_at}</span>
+            </div>
+
+            {/* 邻居关系列表 */}
+            <NeighborList graph={graph} selectedId={selected.id} onPick={setSelected} />
+
+            {selected.metadata && selected.metadata !== '{}' && (
+              <pre style={metaStyle}>{tryFormat(selected.metadata)}</pre>
+            )}
+          </aside>
+        )}
+      </div>
+
+      {hover && !selected && (
+        <div
+          style={{
+            position: 'fixed',
+            left: hover.x + 14,
+            top: hover.y + 14,
+            pointerEvents: 'none',
+            background: 'rgba(15,17,23,0.95)',
+            border: `1px solid ${nodeColor(hover.node.ce_type)}66`,
+            borderRadius: 6,
+            padding: '8px 10px',
+            maxWidth: 280,
+            fontSize: 12,
+            zIndex: 50,
+            boxShadow: '0 8px 24px rgba(0,0,0,0.4)',
+          }}
+        >
+          <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, marginBottom: 4 }}>
+            <span style={{ color: nodeColor(hover.node.ce_type), fontSize: 10, letterSpacing: 1 }}>
+              {CE_LABELS[hover.node.ce_type] || hover.node.ce_type}
+            </span>
+            <span style={{ color: 'var(--text2)', fontSize: 10 }}>{(hover.node.confidence * 100).toFixed(0)}%</span>
+          </div>
+          <div style={{ color: 'var(--text)', fontWeight: 500, marginBottom: 4 }}>{hover.node.title}</div>
+          <div style={{ color: 'var(--text2)', fontSize: 11, lineHeight: 1.4 }}>
+            {hover.node.content && hover.node.content.length > 100
+              ? hover.node.content.slice(0, 100) + '…'
+              : hover.node.content}
+          </div>
+        </div>
+      )}
+
+      <style>{`
+        @keyframes brainPulse { 0%, 100% { opacity: 0.55; transform: scale(1); } 50% { opacity: 1; transform: scale(1.25); } }
+      `}</style>
+    </div>
+  )
+}
+
+// ---------- 子组件 ----------
+function LegendLine({ color, label, dashed }: { color: string; label: string; dashed?: boolean }) {
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 4, fontSize: 11, color: 'var(--text2)' }}>
+      <svg width={28} height={6}>
+        <line x1={0} y1={3} x2={28} y2={3} stroke={color} strokeWidth={1.5} strokeDasharray={dashed ? '4,3' : ''} />
+      </svg>
+      {label}
+    </div>
+  )
+}
+
+function NeighborList({
+  graph,
+  selectedId,
+  onPick,
+}: {
+  graph: KnowledgeGraph
+  selectedId: number
+  onPick: (n: CognitiveNode) => void
+}) {
+  const neighbors = useMemo(() => {
+    const map = new Map<number, CognitiveNode>(graph.nodes.map(n => [n.id, n]))
+    const out: { rel: string; dir: 'out' | 'in'; node: CognitiveNode }[] = []
+    for (const e of graph.edges) {
+      if (e.source_id === selectedId && map.has(e.target_id)) out.push({ rel: e.relation_type, dir: 'out', node: map.get(e.target_id)! })
+      else if (e.target_id === selectedId && map.has(e.source_id)) out.push({ rel: e.relation_type, dir: 'in', node: map.get(e.source_id)! })
+    }
+    return out
+  }, [graph, selectedId])
+
+  if (!neighbors.length) return null
+  return (
+    <div style={{ marginTop: 16 }}>
+      <div style={{ fontSize: 10, color: 'var(--text2)', letterSpacing: 1, marginBottom: 6 }}>
+        关联节点 · {neighbors.length}
+      </div>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+        {neighbors.map((nb, i) => (
+          <button
+            key={i}
+            onClick={() => onPick(nb.node)}
+            style={{
+              textAlign: 'left',
+              background: 'var(--bg3)',
+              border: '1px solid var(--border)',
+              borderLeft: `3px solid ${nodeColor(nb.node.ce_type)}`,
+              color: 'var(--text)',
+              padding: '6px 10px',
+              borderRadius: 4,
+              cursor: 'pointer',
+              fontSize: 12,
+            }}
+          >
+            <span style={{ color: 'var(--text2)', fontSize: 10, marginRight: 6 }}>
+              {nb.dir === 'out' ? '→' : '←'} {REL_LABELS[nb.rel] || nb.rel}
+            </span>
+            {nb.node.title}
+          </button>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+function tryFormat(s: string) {
+  try {
+    return JSON.stringify(JSON.parse(s), null, 2)
+  } catch {
+    return s
+  }
+}
+
+// ---------- 样式 ----------
+const pageStyle: React.CSSProperties = {
+  position: 'fixed',
+  inset: 0,
+  background: 'var(--bg)',
+  display: 'flex',
+  flexDirection: 'column',
+  overflow: 'hidden',
+}
+const headerStyle: React.CSSProperties = {
+  display: 'flex',
+  justifyContent: 'space-between',
+  alignItems: 'center',
+  padding: '12px 24px',
+  borderBottom: '1px solid var(--border)',
+  background: 'rgba(15,17,23,0.85)',
+  backdropFilter: 'blur(10px)',
+  zIndex: 10,
+  flexShrink: 0,
+}
+const backBtn: React.CSSProperties = {
+  background: 'var(--bg2)',
+  border: '1px solid var(--border)',
+  color: 'var(--text2)',
+  borderRadius: 6,
+  padding: '6px 12px',
+  cursor: 'pointer',
+  fontSize: 12,
+}
+const pulseDot: React.CSSProperties = {
+  display: 'inline-block',
+  width: 8,
+  height: 8,
+  borderRadius: 4,
+  background: '#22c55e',
+  boxShadow: '0 0 10px #22c55e',
+  animation: 'brainPulse 1.6s ease-in-out infinite',
+}
+const bgGradient = `radial-gradient(ellipse at 50% 50%, #1a1d27 0%, #0f1117 70%)`
+const legendStyle: React.CSSProperties = {
+  position: 'absolute',
+  left: 16,
+  bottom: 16,
+  padding: '10px 14px',
+  background: 'rgba(26,29,39,0.7)',
+  border: '1px solid var(--border)',
+  borderRadius: 8,
+  backdropFilter: 'blur(8px)',
+}
+const panelStyle: React.CSSProperties = {
+  width: 360,
+  padding: 20,
+  borderLeft: '1px solid var(--border)',
+  background: 'var(--bg2)',
+  overflowY: 'auto',
+  flexShrink: 0,
+}
+const closeBtn: React.CSSProperties = {
+  background: 'none',
+  border: 'none',
+  color: 'var(--text2)',
+  fontSize: 22,
+  cursor: 'pointer',
+  lineHeight: 1,
+  padding: 0,
+}
+const emptyStyle: React.CSSProperties = {
+  position: 'absolute',
+  top: '50%',
+  left: '50%',
+  transform: 'translate(-50%, -50%)',
+  textAlign: 'center',
+}
+const metaStyle: React.CSSProperties = {
+  marginTop: 12,
+  background: 'var(--bg3)',
+  padding: 8,
+  borderRadius: 6,
+  fontSize: 11,
+  color: 'var(--text2)',
+  overflow: 'auto',
+  maxHeight: 160,
+  whiteSpace: 'pre-wrap',
+  wordBreak: 'break-all',
+}

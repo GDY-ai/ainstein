@@ -1,0 +1,1039 @@
+"""
+ATA 编排器（AI to AI Orchestrator）—— Silicon Brain Blueprint §1.3 / §2.5
+================================================================================
+
+设计哲学
+--------
+ATA 编排器是硅基大脑的「**心跳**」与「**神经递质**」系统。它不亲自思考，也
+不命令任何 Agent，而是：
+
+1. **监听** EventBus 上的事件（认知元素创建、博弈结束、Agent 生成等）；
+2. **唤醒** 对应大脑的思考循环（``brain_loop``），把事件喂给合适的 Agent；
+3. **判定** 何时需要发起博弈（出现矛盾 / 反证 / 共识候选）；
+4. **节律** 控制：有事件即刻处理，无事件按 exponential backoff 休眠，避免空
+   转消耗 LLM 配额。
+
+它是 ATA 协作机制（事件触发的 AI ↔ AI 自主互动）的"中枢"，但与所有 Agent
+保持平等 —— 编排器只调度，不裁决；裁决交给博弈引擎。
+
+线程模型
+--------
+- **主单例**：``ATAOrchestrator.instance()``，进程内唯一。
+- **每个大脑一个 loop 线程**：``BrainState.loop_thread`` daemon=True。
+- **事件订阅**：在 ``__init__`` 里挂到 EventBus，处理器线程是事件发布者
+  线程（同步分发）；处理器只做轻量入队 + 唤醒，重活交给 brain_loop。
+- **跨线程同步**：每个 ``BrainState`` 自带 ``threading.Event`` (wake)、
+  ``threading.RLock`` (state_lock) 与一个事件队列。
+
+与既有模块的协作
+----------------
+- ``event_bus.EventBus``      — 订阅 / 发布事件
+- ``cognitive``               — CE 读写（list / get_frontier / get_relations）
+- ``agents.framework``        — AgentPool 管理 Instance、Agent.think 思考
+- ``deliberation``            — 自动发起博弈（矛盾检测后）
+- ``database``                — get_brain / update_brain_state
+"""
+from __future__ import annotations
+
+import logging
+import random
+import threading
+import time
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Any, Callable, Deque, Dict, List, Optional
+
+import database as _db
+from database import get_brain, update_brain_state
+from event_bus import EventBus, EventTypes
+from agents.framework import (
+    AgentPool,
+    BaseAgent,
+    RoleRegistry,
+    ROLES,
+    init_framework,
+)
+import cognitive
+
+logger = logging.getLogger(__name__)
+
+
+# ============================================================
+# 常量
+# ============================================================
+
+#: 思考循环初始休眠秒数（有活动时重置到该值）
+_INITIAL_BACKOFF: float = 1.0
+#: 思考循环最大休眠秒数（完全空闲时上限）
+_MAX_BACKOFF: float = 60.0
+#: 单个事件队列上限，超过则丢弃最早的（避免内存暴涨）
+_EVENT_QUEUE_MAX: int = 256
+#: 单次 think_cycle 内最多处理事件数
+_EVENTS_PER_CYCLE: int = 5
+#: 启动大脑时默认 spawn 的角色（按蓝图 §1.2.3 至少 3 种视角）
+_DEFAULT_SPAWN_ROLES: List[str] = ["explorer", "investigator", "critic"]
+#: 矛盾检测：用于自动发起博弈的 CE 类型白名单
+_DELIB_TRIGGER_CE_TYPES: set = {
+    "hypothesis",
+    "conclusion",
+    "perspective",
+    "counter_evidence",
+    "dissent",
+}
+#: 矛盾关系类型（出现这两种关系任一即视为存在矛盾）
+_CONTRADICTION_RELATIONS: set = {"contradicts", "refutes"}
+#: brain → 单角色思考触发周期内最多调度次数（防止角色霸占）
+_DISPATCH_PER_CYCLE: int = 1
+#: brain_loop 循环内异常时的统一冷静期
+_LOOP_ERROR_COOLDOWN: float = 5.0
+
+
+# ============================================================
+# 大脑运行时状态
+# ============================================================
+
+@dataclass
+class BrainState:
+    """大脑运行时状态（运行在 ATAOrchestrator 进程内的一份缓存）。
+
+    :ivar brain_id: 数据库中 brains.id。
+    :ivar status: ``'thinking' | 'paused' | 'idle' | 'stopped'``。
+    :ivar loop_thread: 后台思考线程；None 时表示尚未启动 / 已停止。
+    :ivar last_activity: 最近一次有「实质活动」的时间戳；用于诊断。
+    :ivar cycle_count: 已完成的思考循环次数。
+    :ivar agent_pool: 引用的 AgentPool 单例（大脑共用，但每个 brain 的 Agent
+        通过 ``brain_id`` 隔离）。
+    :ivar event_queue: 待处理事件队列（由订阅器入队，由 loop 出队）。
+    :ivar wake: 唤醒信号 —— 事件入队时 set，loop 阻塞 wait 直到被唤醒或超时。
+    :ivar state_lock: 保护字段的可重入锁。
+    :ivar started_at: 启动时间戳。
+    :ivar last_error: 最近一次循环异常文本（仅用于状态查询）。
+    """
+
+    brain_id: int
+    status: str = "idle"
+    loop_thread: Optional[threading.Thread] = None
+    last_activity: float = 0.0
+    cycle_count: int = 0
+    agent_pool: Optional[AgentPool] = None
+    event_queue: Deque[Dict[str, Any]] = field(default_factory=lambda: deque(maxlen=_EVENT_QUEUE_MAX))
+    wake: threading.Event = field(default_factory=threading.Event)
+    state_lock: threading.RLock = field(default_factory=threading.RLock)
+    started_at: float = 0.0
+    last_error: Optional[str] = None
+    # 角色级冷却：role_name -> 最近一次该角色思考的时间戳（用于轮转避免单角色霸占）
+    last_role_dispatch: Dict[str, float] = field(default_factory=dict)
+
+
+# ============================================================
+# ATA 编排器主体
+# ============================================================
+
+class ATAOrchestrator:
+    """事件驱动的大脑思考调度器（单例）。
+
+    职责详见模块 docstring。
+
+    使用流程::
+
+        orch = ATAOrchestrator.instance()
+        orch.start_brain(brain_id)        # 启动思考
+        orch.get_brain_status(brain_id)   # 查询
+        orch.pause_brain(brain_id)        # 暂停
+        orch.resume_brain(brain_id)       # 恢复
+        orch.stop_brain(brain_id)         # 完全停止 + 清理
+    """
+
+    _instance: Optional["ATAOrchestrator"] = None
+    _instance_lock: threading.Lock = threading.Lock()
+
+    # ---------- 单例 ----------
+    def __new__(cls) -> "ATAOrchestrator":
+        # 双重检查锁，保证多线程下唯一
+        if cls._instance is None:
+            with cls._instance_lock:
+                if cls._instance is None:
+                    inst = object.__new__(cls)
+                    inst.__dict__["_initialized"] = False
+                    cls._instance = inst
+        return cls._instance
+
+    @classmethod
+    def instance(cls) -> "ATAOrchestrator":
+        """获取（或惰性创建）全局唯一编排器。"""
+        return cls()
+
+    def __init__(self) -> None:
+        # __new__ 确保返回同一实例；这里防止重复初始化
+        if self.__dict__.get("_initialized"):
+            return
+        self.brains: Dict[int, BrainState] = {}
+        self._brains_lock: threading.RLock = threading.RLock()
+        self.event_bus: EventBus = EventBus.instance()
+        self.agent_pool: AgentPool = AgentPool.instance()
+        self._running: bool = True
+        self._subscribed: bool = False
+        # 初始化角色（幂等）+ 订阅事件
+        try:
+            init_framework()
+        except Exception:
+            logger.exception("init_framework 失败（角色注册）；继续启动编排器")
+        self._subscribe_events()
+        self.__dict__["_initialized"] = True
+        logger.info("ATAOrchestrator 初始化完成")
+
+    # ============================================================
+    # 事件订阅
+    # ============================================================
+    def _subscribe_events(self) -> None:
+        """挂载关键事件处理器到 EventBus（仅一次）。"""
+        if self._subscribed:
+            return
+
+        bus = self.event_bus
+        # 大脑生命周期
+        bus.subscribe(EventTypes.BRAIN_CREATED, self._on_brain_created)
+
+        # 用户输入 → 应触发探索
+        bus.subscribe(EventTypes.USER_SEED_QUESTION_SUBMITTED, self._on_user_input)
+
+        # CE 链 —— 这些事件统一走 _enqueue_event，loop 决定怎么处理
+        for evt in (
+            EventTypes.CE_CREATED,
+            EventTypes.CE_OBSERVATION_CREATED,
+            EventTypes.CE_QUESTION_RAISED,
+            EventTypes.CE_HYPOTHESIS_PROPOSED,
+            EventTypes.CE_EVIDENCE_COLLECTED,
+            EventTypes.CE_HYPOTHESIS_SATURATED,
+            EventTypes.CE_CONCLUSION_PROPOSED,
+            EventTypes.CE_PERSPECTIVE_FORMED,
+            EventTypes.CE_INSIGHT_EMERGED,
+            EventTypes.CE_CHALLENGED,
+        ):
+            bus.subscribe(evt, self._on_ce_event)
+
+        # 共识/分歧 —— 也入队，但额外触发综合者
+        bus.subscribe(EventTypes.CE_CONSENSUS_REACHED, self._on_ce_event)
+        bus.subscribe(EventTypes.CE_DISSENT_DETECTED, self._on_ce_event)
+        bus.subscribe(EventTypes.CE_CONCLUSION_ACCEPTED, self._on_ce_event)
+
+        # 博弈结束 → 推进综合者 + 共识落库
+        bus.subscribe(EventTypes.DELIBERATION_CONCLUDED, self._on_deliberation_concluded)
+        # 博弈请求 → 编排器代理执行（事件驱动博弈入口）
+        bus.subscribe(EventTypes.DELIBERATION_REQUESTED, self._on_deliberation_requested)
+
+        # Agent 生命周期
+        bus.subscribe(EventTypes.AGENT_SPAWNED, self._on_agent_spawned)
+
+        self._subscribed = True
+        logger.info("ATAOrchestrator 事件订阅完成: %s", self.event_bus.list_handlers())
+
+    # ============================================================
+    # 大脑生命周期管理
+    # ============================================================
+    def start_brain(self, brain_id: int) -> bool:
+        """启动一个大脑的思考循环。
+
+        如果该大脑已在 thinking 状态，返回 False 并保持原状；如果在 paused，
+        则退化为 ``resume_brain``。
+
+        :return: 是否成功启动 / 转换状态。
+        """
+        brain_row = get_brain(brain_id)
+        if not brain_row:
+            logger.warning("start_brain: brain_id=%s 不存在", brain_id)
+            return False
+
+        with self._brains_lock:
+            state = self.brains.get(brain_id)
+            if state and state.status == "thinking":
+                logger.info("start_brain: brain=%s 已在 thinking", brain_id)
+                return False
+            if state and state.status == "paused":
+                # 原线程仍在 → 走 resume
+                return self._resume_locked(state)
+
+            state = BrainState(
+                brain_id=brain_id,
+                status="thinking",
+                agent_pool=self.agent_pool,
+                started_at=time.time(),
+            )
+            self.brains[brain_id] = state
+
+        # 在锁外做较重的初始化：spawn 默认 Agent
+        self._ensure_initial_agents(brain_id)
+
+        # 更新 DB 状态
+        try:
+            update_brain_state(brain_id, "thinking", started_at=_now_iso(),
+                               last_active_at=_now_iso())
+        except Exception:
+            logger.exception("update_brain_state 失败 brain=%s", brain_id)
+
+        # 启动后台线程
+        thread = threading.Thread(
+            target=self._brain_loop,
+            args=(brain_id,),
+            name=f"BrainLoop-{brain_id}",
+            daemon=True,
+        )
+        with state.state_lock:
+            state.loop_thread = thread
+        thread.start()
+
+        logger.info("start_brain: brain=%s 已启动思考循环", brain_id)
+        # 发布"恢复 / 启动"事件，方便观察员订阅
+        try:
+            self.event_bus.publish(
+                event_type=EventTypes.BRAIN_RESUMED,
+                brain_id=brain_id,
+                payload={"reason": "start", "cycle_count": 0},
+            )
+        except Exception:
+            logger.exception("发布 BRAIN_RESUMED 失败 brain=%s", brain_id)
+        return True
+
+    def pause_brain(self, brain_id: int) -> bool:
+        """暂停指定大脑思考；线程保持存活但不再调度新工作。"""
+        with self._brains_lock:
+            state = self.brains.get(brain_id)
+            if not state:
+                logger.warning("pause_brain: brain=%s 未启动", brain_id)
+                return False
+
+        with state.state_lock:
+            if state.status != "thinking":
+                logger.info("pause_brain: brain=%s 当前状态=%s 无需暂停",
+                            brain_id, state.status)
+                return False
+            state.status = "paused"
+            state.wake.set()  # 让循环立刻醒来感知 status 变化
+
+        try:
+            update_brain_state(brain_id, "paused", last_active_at=_now_iso())
+        except Exception:
+            logger.exception("update_brain_state(paused) 失败 brain=%s", brain_id)
+
+        try:
+            self.event_bus.publish(
+                event_type=EventTypes.BRAIN_PAUSED,
+                brain_id=brain_id,
+                payload={"reason": "manual"},
+            )
+        except Exception:
+            logger.exception("发布 BRAIN_PAUSED 失败 brain=%s", brain_id)
+
+        logger.info("pause_brain: brain=%s 已暂停", brain_id)
+        return True
+
+    def resume_brain(self, brain_id: int) -> bool:
+        """从 paused 状态恢复思考。"""
+        with self._brains_lock:
+            state = self.brains.get(brain_id)
+            if not state:
+                # 未启动 → 走完整启动流程
+                return self.start_brain(brain_id)
+        return self._resume_locked(state)
+
+    def _resume_locked(self, state: BrainState) -> bool:
+        """已持有 brains_lock 时的恢复实现。"""
+        with state.state_lock:
+            if state.status == "thinking":
+                return False
+            state.status = "thinking"
+            state.wake.set()
+            # 若线程已退出 → 重新拉起
+            if state.loop_thread is None or not state.loop_thread.is_alive():
+                t = threading.Thread(
+                    target=self._brain_loop,
+                    args=(state.brain_id,),
+                    name=f"BrainLoop-{state.brain_id}",
+                    daemon=True,
+                )
+                state.loop_thread = t
+                t.start()
+
+        try:
+            update_brain_state(state.brain_id, "thinking", last_active_at=_now_iso())
+        except Exception:
+            logger.exception("update_brain_state(resume) 失败 brain=%s", state.brain_id)
+
+        try:
+            self.event_bus.publish(
+                event_type=EventTypes.BRAIN_RESUMED,
+                brain_id=state.brain_id,
+                payload={"reason": "manual", "cycle_count": state.cycle_count},
+            )
+        except Exception:
+            logger.exception("发布 BRAIN_RESUMED 失败 brain=%s", state.brain_id)
+
+        logger.info("resume_brain: brain=%s 已恢复", state.brain_id)
+        return True
+
+    def stop_brain(self, brain_id: int) -> bool:
+        """停止并清理大脑：标记 stopped，等待循环退出，并从字典中移除。
+
+        本方法不会销毁 ``agent_instances`` 行（保留历史可追溯）。
+        """
+        with self._brains_lock:
+            state = self.brains.get(brain_id)
+            if not state:
+                logger.info("stop_brain: brain=%s 未启动，跳过", brain_id)
+                return False
+
+        with state.state_lock:
+            state.status = "stopped"
+            state.wake.set()
+            thread = state.loop_thread
+
+        # 等待线程退出（限 5s）
+        if thread and thread.is_alive():
+            thread.join(timeout=5.0)
+
+        with self._brains_lock:
+            self.brains.pop(brain_id, None)
+
+        try:
+            update_brain_state(brain_id, "archived", last_active_at=_now_iso())
+        except Exception:
+            logger.exception("update_brain_state(archived) 失败 brain=%s", brain_id)
+
+        try:
+            self.event_bus.publish(
+                event_type=EventTypes.BRAIN_ARCHIVED,
+                brain_id=brain_id,
+                payload={"reason": "stopped"},
+            )
+        except Exception:
+            logger.exception("发布 BRAIN_ARCHIVED 失败 brain=%s", brain_id)
+
+        logger.info("stop_brain: brain=%s 已停止并清理", brain_id)
+        return True
+
+    # ============================================================
+    # 初始 Agent 装配
+    # ============================================================
+    def _ensure_initial_agents(self, brain_id: int) -> List[BaseAgent]:
+        """确保大脑至少有 3 个不同视角的活跃 Agent。
+
+        策略：
+        1. 先取 ``ensure_minimum`` 兜底（满足每个角色的 default_quota_min）。
+        2. 若仍不足 3 个不同角色，按 ``_DEFAULT_SPAWN_ROLES`` 顺序补足。
+        """
+        try:
+            self.agent_pool.ensure_minimum(brain_id)
+        except Exception:
+            logger.exception("ensure_minimum 失败 brain=%s", brain_id)
+
+        existing = self.agent_pool.get_agents(brain_id)
+        roles_present = {a.role_name for a in existing}
+        spawned: List[BaseAgent] = []
+
+        for role_name in _DEFAULT_SPAWN_ROLES:
+            if role_name in roles_present:
+                continue
+            try:
+                if RoleRegistry.get_role(role_name) is None:
+                    logger.warning("角色未注册，跳过 spawn: %s", role_name)
+                    continue
+                agent = self.agent_pool.spawn(brain_id, role_name)
+                spawned.append(agent)
+                roles_present.add(role_name)
+            except Exception:
+                logger.exception("spawn 失败 brain=%s role=%s", brain_id, role_name)
+
+        if spawned:
+            logger.info("brain=%s 初始化补 spawn %d 个 Agent: %s",
+                        brain_id, len(spawned),
+                        [(a.role_name, a.instance_id) for a in spawned])
+        return existing + spawned
+
+    # ============================================================
+    # 思考主循环
+    # ============================================================
+    def _brain_loop(self, brain_id: int) -> None:
+        """大脑思考主循环 —— 在专属后台线程中执行。
+
+        节律：
+            - 有事件 / frontier 探索 → backoff 重置为 1s
+            - 完全空闲 → 指数退避，封顶 60s
+            - 任何异常 → 冷静 5s 继续
+        """
+        state = self.brains.get(brain_id)
+        if state is None:
+            logger.error("_brain_loop: brain=%s 状态丢失，循环退出", brain_id)
+            return
+
+        backoff = _INITIAL_BACKOFF
+        logger.info("brain=%s loop started (thread=%s)",
+                    brain_id, threading.current_thread().name)
+
+        while True:
+            with state.state_lock:
+                status = state.status
+            if status == "stopped":
+                logger.info("brain=%s loop 收到 stopped，退出", brain_id)
+                return
+            if status == "paused":
+                # paused 时只 wait wake，不思考
+                state.wake.clear()
+                state.wake.wait(timeout=2.0)
+                continue
+
+            # status == 'thinking'
+            try:
+                activity = self._think_cycle(brain_id)
+                with state.state_lock:
+                    state.cycle_count += 1
+                    if activity:
+                        state.last_activity = time.time()
+                        backoff = _INITIAL_BACKOFF
+                    else:
+                        backoff = min(backoff * 1.5, _MAX_BACKOFF)
+                    state.last_error = None
+            except Exception as exc:
+                logger.exception("brain=%s _think_cycle 异常", brain_id)
+                with state.state_lock:
+                    state.last_error = repr(exc)
+                time.sleep(_LOOP_ERROR_COOLDOWN)
+                continue
+
+            # 周期性发布 cycle.tick 事件（每 5 个循环一次，给观察员提供心跳）
+            if state.cycle_count % 5 == 0:
+                try:
+                    self.event_bus.publish(
+                        event_type=EventTypes.BRAIN_CYCLE_TICK,
+                        brain_id=brain_id,
+                        payload={
+                            "cycle_count": state.cycle_count,
+                            "last_activity": state.last_activity,
+                            "queue_size": len(state.event_queue),
+                            "backoff": backoff,
+                        },
+                    )
+                except Exception:
+                    logger.exception("BRAIN_CYCLE_TICK 发布失败 brain=%s", brain_id)
+
+            # 唤醒驱动的休眠：如果在 backoff 期间被事件唤醒会立即继续
+            state.wake.clear()
+            state.wake.wait(timeout=backoff)
+
+    # ============================================================
+    # 单次思考循环
+    # ============================================================
+    def _think_cycle(self, brain_id: int) -> bool:
+        """单次思考循环。
+
+        :return: 是否产生了「实质活动」（事件被处理 or frontier 思考 or 博弈触发）。
+        """
+        state = self.brains[brain_id]
+        activity = False
+
+        # 1) 处理事件队列（限量，避免单次循环过长）
+        events_to_process: List[Dict[str, Any]] = []
+        with state.state_lock:
+            for _ in range(_EVENTS_PER_CYCLE):
+                if not state.event_queue:
+                    break
+                events_to_process.append(state.event_queue.popleft())
+
+        for event in events_to_process:
+            try:
+                handled = self._dispatch_event_to_agent(brain_id, event)
+                activity = activity or handled
+            except Exception:
+                logger.exception("事件分派失败 brain=%s event=%s",
+                                 brain_id, event.get("type"))
+
+        # 2) 若无事件，去 frontier 找一个低置信度问题让 explorer/critic 思考
+        if not events_to_process:
+            try:
+                if self._explore_frontier(brain_id):
+                    activity = True
+            except Exception:
+                logger.exception("frontier 探索失败 brain=%s", brain_id)
+
+        # 3) 矛盾扫描 → 自动博弈
+        try:
+            if self._scan_and_trigger_deliberation(brain_id):
+                activity = True
+        except Exception:
+            logger.exception("矛盾扫描失败 brain=%s", brain_id)
+
+        return activity
+
+    # ============================================================
+    # 事件 → Agent 分派
+    # ============================================================
+    def _dispatch_event_to_agent(
+        self,
+        brain_id: int,
+        event: Dict[str, Any],
+    ) -> bool:
+        """把单个事件交给最合适的 Agent 思考。
+
+        返回是否真的调度了某个 Agent.think。
+        """
+        # 状态守门
+        state = self.brains.get(brain_id)
+        if state is None or state.status != "thinking":
+            return False
+
+        agent = self._dispatch_to_agent(brain_id, {"event": event})
+        if agent is None:
+            logger.debug("brain=%s event=%s 无合适 Agent，跳过",
+                         brain_id, event.get("type"))
+            return False
+
+        # 真正的思考由 Agent.react_to_event 执行（其内部装配 ThinkingContext）
+        logger.info("brain=%s dispatch event=%s -> agent[%s/%s]",
+                    brain_id, event.get("type"),
+                    agent.role_name, agent.instance_id)
+        try:
+            agent.react_to_event(event)
+            with state.state_lock:
+                state.last_role_dispatch[agent.role_name] = time.time()
+            return True
+        except Exception:
+            logger.exception("agent.react_to_event 异常 instance=%s",
+                             agent.instance_id)
+            return False
+
+    def _dispatch_to_agent(
+        self,
+        brain_id: int,
+        context: Dict[str, Any],
+    ) -> Optional[BaseAgent]:
+        """根据上下文选择最合适的 Agent。
+
+        ``context`` 至少包含 ``event`` 字段（事件 dict）。
+        选择策略：
+            1. 根据事件类型映射到候选角色集合（蓝图 §1.3.2 默认订阅规则）。
+            2. 在该 brain 中找属于这些角色的活跃 Agent。
+            3. 优先选择 ``last_role_dispatch`` 最久未调度的（轮转，避免霸占）。
+            4. 找不到则尝试 spawn 一个（受配额限制），仍失败返回 None。
+        """
+        event = context.get("event") or {}
+        event_type: str = event.get("type", "")
+        candidate_roles = _EVENT_TO_ROLES.get(event_type, set())
+        if not candidate_roles:
+            # 未指定 → 默认让 explorer 兜底（探索性思考）
+            candidate_roles = {"explorer"}
+
+        # 先在已有 Agent 池中找
+        agents = self.agent_pool.get_agents(brain_id)
+        eligible = [a for a in agents if a.role_name in candidate_roles]
+
+        if not eligible:
+            # 配额内尝试 spawn 一个该候选集合中的角色
+            for role in candidate_roles:
+                try:
+                    if not self.agent_pool.can_spawn(brain_id, role):
+                        continue
+                    new_agent = self.agent_pool.spawn(brain_id, role)
+                    eligible.append(new_agent)
+                    break
+                except Exception:
+                    logger.exception("spawn %s 失败 brain=%s", role, brain_id)
+
+        if not eligible:
+            return None
+
+        # 轮转：选最久未调度的角色（同角色多个时随机挑一个实例）
+        state = self.brains.get(brain_id)
+        last_map: Dict[str, float] = (state.last_role_dispatch if state else {})
+
+        def _last_key(a: BaseAgent) -> float:
+            return last_map.get(a.role_name, 0.0)
+
+        eligible.sort(key=_last_key)
+        # 同 role 多实例 → 在最旧 role 中随机抽一个
+        oldest_role = eligible[0].role_name
+        same_role = [a for a in eligible if a.role_name == oldest_role]
+        return random.choice(same_role)
+
+    # ============================================================
+    # 认知边界探索（无事件时的"自驱思考"）
+    # ============================================================
+    def _explore_frontier(self, brain_id: int) -> bool:
+        """空闲时让 explorer 选一个边界问题主动思考。
+
+        - 取 frontier 候选并随机抽一个；
+        - 把它包装成一个伪事件交给 explorer.react_to_event。
+        - 若大脑还很空（无任何 CE），直接让 explorer 自由发挥。
+        """
+        try:
+            frontier = cognitive.get_frontier(brain_id, limit=10)
+        except Exception:
+            logger.exception("get_frontier 失败 brain=%s", brain_id)
+            return False
+
+        elements = frontier.get("elements") or []
+        target_ce = random.choice(elements) if elements else None
+
+        # 选 explorer，没有就 spawn
+        explorer = self._pick_or_spawn(brain_id, "explorer")
+        if explorer is None:
+            return False
+
+        # 构造伪事件供 react_to_event 使用
+        if target_ce:
+            pseudo_event = {
+                "event_id": f"frontier-{brain_id}-{int(time.time())}",
+                "type": EventTypes.CE_QUESTION_RAISED,
+                "brain_id": brain_id,
+                "payload": {
+                    "ce_id": target_ce.get("id"),
+                    "type": target_ce.get("type"),
+                    "title": (target_ce.get("payload") or {}).get("title", ""),
+                    "_source": "frontier_explore",
+                },
+                "source_agent_id": None,
+            }
+        else:
+            # 完全空大脑 → 让 explorer 从种子问题开始
+            brain = get_brain(brain_id)
+            seed = (brain or {}).get("seed_question", "")
+            pseudo_event = {
+                "event_id": f"seed-{brain_id}-{int(time.time())}",
+                "type": EventTypes.USER_SEED_QUESTION_SUBMITTED,
+                "brain_id": brain_id,
+                "payload": {"seed_question": seed, "_source": "auto_seed"},
+                "source_agent_id": None,
+            }
+
+        logger.info("brain=%s frontier 探索 -> explorer[%s] target_ce=%s",
+                    brain_id, explorer.instance_id,
+                    (target_ce or {}).get("id"))
+        try:
+            explorer.react_to_event(pseudo_event)
+            state = self.brains.get(brain_id)
+            if state:
+                with state.state_lock:
+                    state.last_role_dispatch[explorer.role_name] = time.time()
+            return True
+        except Exception:
+            logger.exception("explorer.react_to_event 失败 instance=%s",
+                             explorer.instance_id)
+            return False
+
+    def _pick_or_spawn(self, brain_id: int, role_name: str) -> Optional[BaseAgent]:
+        """从池子里找指定角色 Agent；找不到则 spawn 一个；都失败返回 None。"""
+        try:
+            agents = self.agent_pool.get_agents(brain_id, role_name=role_name)
+            if agents:
+                return random.choice(agents)
+            if self.agent_pool.can_spawn(brain_id, role_name):
+                return self.agent_pool.spawn(brain_id, role_name)
+        except Exception:
+            logger.exception("_pick_or_spawn 失败 brain=%s role=%s",
+                             brain_id, role_name)
+        return None
+
+    # ============================================================
+    # 矛盾检测 + 自动博弈
+    # ============================================================
+    def _scan_and_trigger_deliberation(self, brain_id: int) -> bool:
+        """扫描最近的 CE，发现矛盾即自动发起博弈。
+
+        简化判定（避免高频调用）：
+        1. 取最近 ~30 个 CE。
+        2. 找 ``contradicts`` / ``refutes`` 关系，且对应的目标 CE 还没有
+           活跃博弈。
+        3. 按 ``deliberations.uniq_active_deliberation`` 唯一索引，
+           已有未结案博弈会自动被 DB 拒绝；这里再加一层 in-memory 去重。
+
+        触发频率受循环节律自然限制；为防爆量，每次至多触发一场。
+        """
+        try:
+            recent = cognitive.list_elements(brain_id, limit=30)
+        except Exception:
+            logger.exception("list_elements 失败 brain=%s", brain_id)
+            return False
+
+        if not recent:
+            return False
+
+        # 拉一次全部关系（量级 < 1k 时可接受；后续可优化）
+        try:
+            with _db.get_db() as conn:
+                rel_rows = conn.execute(
+                    "SELECT src_id, dst_id, relation FROM cognitive_relations "
+                    "WHERE brain_id=? AND relation IN ('contradicts','refutes')",
+                    (brain_id,),
+                ).fetchall()
+        except Exception:
+            logger.exception("查询矛盾关系失败 brain=%s", brain_id)
+            return False
+
+        if not rel_rows:
+            return False
+
+        recent_ids = {ce["id"] for ce in recent}
+        for row in rel_rows:
+            src_id, dst_id = row["src_id"], row["dst_id"]
+            if src_id not in recent_ids and dst_id not in recent_ids:
+                continue
+            # 选一个"被反驳的"目标 CE 作为博弈对象 (优先 dst)
+            target_ce_id = dst_id
+            target_ce = cognitive.get_element(target_ce_id)
+            if not target_ce:
+                continue
+            if target_ce.get("type") not in _DELIB_TRIGGER_CE_TYPES:
+                continue
+
+            topic = (
+                f"是否应当推翻 CE#{target_ce_id} "
+                f"({(target_ce.get('payload') or {}).get('title') or target_ce.get('content', '')[:40]})？"
+            )
+            triggered = self._trigger_deliberation(
+                brain_id=brain_id,
+                topic=topic,
+                trigger_ce_id=target_ce_id,
+            )
+            if triggered:
+                return True
+
+        return False
+
+    def _trigger_deliberation(
+        self,
+        brain_id: int,
+        topic: str,
+        trigger_ce_id: int,
+        related_ces: Optional[List[int]] = None,  # 兼容签名占位
+    ) -> bool:
+        """在后台线程里发起一场博弈讨论。
+
+        我们不阻塞 brain_loop —— 博弈本身耗时（多轮 LLM 调用）。
+        ``deliberations.uniq_active_deliberation`` 唯一索引会保证同一 CE
+        不会出现两场未结案博弈，DB 拒绝时这里捕获异常即可。
+        """
+        # 延迟导入，避免顶层循环依赖
+        from deliberation import DeliberationEngine
+
+        def _run():
+            engine = DeliberationEngine()
+            try:
+                result = engine.deliberate(
+                    brain_id=brain_id,
+                    topic=topic,
+                    trigger_ce_id=trigger_ce_id,
+                )
+                logger.info(
+                    "brain=%s 自动博弈完成 deliberation=%s outcome=%s ce=%s",
+                    brain_id, result.deliberation_id, result.outcome, result.final_ce_id,
+                )
+            except ValueError as e:
+                # 参与者不足或重复博弈 —— 记录后忽略
+                logger.info("brain=%s 自动博弈未发起: %s", brain_id, e)
+            except Exception:
+                logger.exception("brain=%s 自动博弈异常", brain_id)
+
+        threading.Thread(
+            target=_run,
+            name=f"AutoDelib-{brain_id}-{trigger_ce_id}",
+            daemon=True,
+        ).start()
+        logger.info("brain=%s 触发自动博弈 trigger_ce=%s topic=%r",
+                    brain_id, trigger_ce_id, topic[:60])
+        return True
+
+    # ============================================================
+    # 事件订阅器（轻量入队 + 唤醒，重活由 loop 干）
+    # ============================================================
+    def _enqueue_event(self, event: Dict[str, Any]) -> None:
+        """把事件入队对应大脑的事件队列，并唤醒其循环。"""
+        brain_id = event.get("brain_id")
+        if brain_id is None:
+            return
+        with self._brains_lock:
+            state = self.brains.get(brain_id)
+        if state is None:
+            return
+        with state.state_lock:
+            # 队列满时 deque 自动丢弃最老元素（maxlen 行为）
+            state.event_queue.append(event)
+            state.wake.set()
+
+    def _on_ce_event(self, event: Dict[str, Any]) -> None:
+        """所有 CE 类事件统一入队。"""
+        try:
+            self._enqueue_event(event)
+        except Exception:
+            logger.exception("_on_ce_event 入队失败 event=%s", event.get("type"))
+
+    # —— BRAIN_CREATED：自动启动该大脑 ——
+    def _on_brain_created(self, event: Dict[str, Any]) -> None:
+        brain_id = event.get("brain_id")
+        if brain_id is None:
+            return
+        try:
+            self.start_brain(int(brain_id))
+        except Exception:
+            logger.exception("_on_brain_created 启动失败 brain=%s", brain_id)
+
+    # —— USER_SEED_QUESTION：把"种子问题"作为事件入队让 explorer 思考 ——
+    def _on_user_input(self, event: Dict[str, Any]) -> None:
+        self._enqueue_event(event)
+
+    # —— DELIBERATION_REQUESTED：编排器代为执行未启动的博弈 ——
+    def _on_deliberation_requested(self, event: Dict[str, Any]) -> None:
+        """订阅博弈请求事件 —— 通常由 Agent 在 think 中提出。
+
+        约定：payload 至少含 ``target_ce_id`` / ``motion`` (或 ``topic``)。
+        ``deliberation_id`` 已存在表示发起方已经启动了，这里就不重复触发。
+        """
+        payload = event.get("payload") or {}
+        if payload.get("deliberation_id"):
+            # 已经有 deliberation 行 → 由发起方驱动；编排器只观望
+            return
+
+        brain_id = event.get("brain_id")
+        target_ce_id = payload.get("target_ce_id") or payload.get("ce_id")
+        topic = payload.get("topic") or payload.get("motion")
+        if not (brain_id and target_ce_id and topic):
+            logger.debug("DELIBERATION_REQUESTED 缺字段，忽略：%s", payload)
+            return
+        try:
+            self._trigger_deliberation(
+                brain_id=int(brain_id),
+                topic=str(topic),
+                trigger_ce_id=int(target_ce_id),
+            )
+        except Exception:
+            logger.exception("响应 DELIBERATION_REQUESTED 失败")
+
+    # —— DELIBERATION_CONCLUDED：通知 synthesizer 综合 ——
+    def _on_deliberation_concluded(self, event: Dict[str, Any]) -> None:
+        """博弈结束：把事件入队，让 synthesizer 等综合性 Agent 接手。"""
+        self._enqueue_event(event)
+
+    # —— AGENT_SPAWNED：仅日志 / 心跳 ——
+    def _on_agent_spawned(self, event: Dict[str, Any]) -> None:
+        payload = event.get("payload") or {}
+        logger.debug("Agent spawned: brain=%s role=%s id=%s",
+                     event.get("brain_id"), payload.get("role"),
+                     payload.get("agent_id"))
+
+    # ============================================================
+    # API 辅助
+    # ============================================================
+    def get_brain_status(self, brain_id: int) -> Optional[Dict[str, Any]]:
+        """获取大脑运行状态（None 表示未在编排器中）。"""
+        with self._brains_lock:
+            state = self.brains.get(brain_id)
+        if state is None:
+            return None
+        with state.state_lock:
+            counts = {}
+            try:
+                counts = self.agent_pool.get_active_count(brain_id)
+            except Exception:
+                logger.exception("get_active_count 失败 brain=%s", brain_id)
+            return {
+                "brain_id": brain_id,
+                "status": state.status,
+                "cycle_count": state.cycle_count,
+                "queue_size": len(state.event_queue),
+                "last_activity": state.last_activity,
+                "started_at": state.started_at,
+                "thread_alive": bool(state.loop_thread and state.loop_thread.is_alive()),
+                "agent_counts": counts,
+                "last_error": state.last_error,
+            }
+
+    def list_active_brains(self) -> List[Dict[str, Any]]:
+        """列出编排器内所有大脑及其状态。"""
+        out: List[Dict[str, Any]] = []
+        with self._brains_lock:
+            ids = list(self.brains.keys())
+        for bid in ids:
+            info = self.get_brain_status(bid)
+            if info:
+                out.append(info)
+        return out
+
+
+# ============================================================
+# 事件 → 候选角色映射（与 framework._DEFAULT_ROLE_EVENT_INTEREST 对偶）
+# ============================================================
+#: 每个事件类型对应「应该响应它」的角色集合。
+#: 编排器据此挑 Agent；空集合表示无人感兴趣（默认走 explorer 兜底）。
+_EVENT_TO_ROLES: Dict[str, set] = {
+    EventTypes.USER_SEED_QUESTION_SUBMITTED: {"explorer"},
+    EventTypes.CE_OBSERVATION_CREATED: {"explorer", "investigator"},
+    EventTypes.CE_QUESTION_RAISED: {"investigator", "explorer"},
+    EventTypes.CE_HYPOTHESIS_PROPOSED: {"investigator", "critic"},
+    EventTypes.CE_EVIDENCE_COLLECTED: {"reasoner", "critic"},
+    EventTypes.CE_HYPOTHESIS_SATURATED: {"reasoner"},
+    EventTypes.CE_CONCLUSION_PROPOSED: {"critic", "synthesizer"},
+    EventTypes.CE_CONCLUSION_ACCEPTED: {"synthesizer", "observer"},
+    EventTypes.CE_PERSPECTIVE_FORMED: {"synthesizer"},
+    EventTypes.CE_CONSENSUS_REACHED: {"synthesizer", "observer"},
+    EventTypes.CE_DISSENT_DETECTED: {"critic", "synthesizer"},
+    EventTypes.CE_INSIGHT_EMERGED: {"synthesizer", "observer"},
+    EventTypes.CE_CHALLENGED: {"critic"},
+    EventTypes.DELIBERATION_CONCLUDED: {"synthesizer"},
+    EventTypes.CE_CREATED: set(),  # 通用事件：让默认 explorer 兜底
+}
+
+
+# ============================================================
+# 模块工具
+# ============================================================
+def _now_iso() -> str:
+    """生成与 SQLite ``datetime('now')`` 同格式的 UTC 时间字符串。"""
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
+
+
+# ============================================================
+# 模块级便捷接口
+# ============================================================
+
+#: 全局编排器单例
+orchestrator: ATAOrchestrator = ATAOrchestrator.instance()
+
+
+def start_brain(brain_id: int) -> bool:
+    """启动一个大脑思考（模块级别捷径）。"""
+    return orchestrator.start_brain(brain_id)
+
+
+def pause_brain(brain_id: int) -> bool:
+    """暂停一个大脑思考。"""
+    return orchestrator.pause_brain(brain_id)
+
+
+def resume_brain(brain_id: int) -> bool:
+    """恢复一个大脑思考。"""
+    return orchestrator.resume_brain(brain_id)
+
+
+def stop_brain(brain_id: int) -> bool:
+    """停止并清理一个大脑。"""
+    return orchestrator.stop_brain(brain_id)
+
+
+def get_brain_status(brain_id: int) -> Optional[Dict[str, Any]]:
+    """查询大脑运行状态。"""
+    return orchestrator.get_brain_status(brain_id)
+
+
+def list_active_brains() -> List[Dict[str, Any]]:
+    """列出所有活跃大脑。"""
+    return orchestrator.list_active_brains()
+
+
+__all__ = [
+    "ATAOrchestrator",
+    "BrainState",
+    "orchestrator",
+    "start_brain",
+    "pause_brain",
+    "resume_brain",
+    "stop_brain",
+    "get_brain_status",
+    "list_active_brains",
+]

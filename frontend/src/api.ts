@@ -1,24 +1,122 @@
+import type {
+  AuthResponse,
+  Brain,
+  BrainFrontier,
+  CreateBrainResponse,
+  KnowledgeGraph,
+  User,
+} from './types';
+
 const BASE = '/ainstein/api';
 
+const TOKEN_KEY = 'ainstein.token';
+
+export function getToken(): string | null {
+  try {
+    return localStorage.getItem(TOKEN_KEY);
+  } catch {
+    return null;
+  }
+}
+
+export function setToken(token: string | null) {
+  try {
+    if (token) localStorage.setItem(TOKEN_KEY, token);
+    else localStorage.removeItem(TOKEN_KEY);
+  } catch {
+    /* ignore */
+  }
+}
+
+const USER_KEY = 'ainstein.user';
+
+export function getStoredUser(): User | null {
+  try {
+    const raw = localStorage.getItem(USER_KEY);
+    return raw ? (JSON.parse(raw) as User) : null;
+  } catch {
+    return null;
+  }
+}
+
+export function setStoredUser(user: User | null) {
+  try {
+    if (user) localStorage.setItem(USER_KEY, JSON.stringify(user));
+    else localStorage.removeItem(USER_KEY);
+  } catch {
+    /* ignore */
+  }
+}
+
 async function request(path: string, opts?: RequestInit) {
-  const resp = await fetch(`${BASE}${path}`, opts);
-  if (!resp.ok) throw new Error(`${resp.status}: ${await resp.text()}`);
+  const headers: Record<string, string> = {
+    ...(opts?.headers as Record<string, string> | undefined),
+  };
+  const token = getToken();
+  if (token) headers['Authorization'] = `Bearer ${token}`;
+  const resp = await fetch(`${BASE}${path}`, { ...opts, headers });
+  if (resp.status === 401) {
+    // token 失效 → 清掉
+    setToken(null);
+    setStoredUser(null);
+  }
+  if (!resp.ok) {
+    const text = await resp.text();
+    let msg = text;
+    try {
+      const obj = JSON.parse(text);
+      if (obj?.error) msg = obj.error;
+    } catch {
+      /* keep raw */
+    }
+    throw new Error(msg || `${resp.status}`);
+  }
+  if (resp.status === 204) return null;
   return resp.json();
+}
+
+function jsonBody(data: unknown): RequestInit {
+  return {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  };
 }
 
 export const api = {
   health: () => request('/health'),
+
+  // === Auth ===
+  register: (data: { username: string; password: string; email?: string }) =>
+    request('/auth/register', jsonBody(data)) as Promise<AuthResponse>,
+  login: (data: { username: string; password: string }) =>
+    request('/auth/login', jsonBody(data)) as Promise<AuthResponse>,
+  me: () => request('/auth/me') as Promise<{ user: User }>,
+
+  // === Brains ===
+  listBrains: (opts?: { all?: boolean }) =>
+    request(`/brains${opts?.all ? '?all=1' : ''}`) as Promise<{ items: Brain[] }>,
+  createBrain: (data: { name: string; seed_question: string; config?: object }) =>
+    request('/brains', jsonBody(data)) as Promise<CreateBrainResponse>,
+  getBrain: (brainId: number) =>
+    request(`/brains/${brainId}`) as Promise<Brain>,
+  pauseBrain: (brainId: number) =>
+    request(`/brains/${brainId}/pause`, { method: 'POST' }) as Promise<{ status: string; brain: Brain }>,
+  resumeBrain: (brainId: number) =>
+    request(`/brains/${brainId}/resume`, { method: 'POST' }) as Promise<{ status: string; brain: Brain }>,
+
+  // === Legacy projects (Phase 0~4) ===
   listProjects: () => request('/projects'),
   createProject: (data: {name: string; mission: string; domain: string; config?: object}) =>
-    request('/projects', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(data)}),
+    request('/projects', jsonBody(data)),
   getProject: (id: number) => request(`/projects/${id}`),
   getQueue: (id: number) => request(`/projects/${id}/queue`),
   addQueueItem: (id: number, data: {topic: string; priority?: number}) =>
-    request(`/projects/${id}/queue`, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(data)}),
+    request(`/projects/${id}/queue`, jsonBody(data)),
   getSessions: (id: number) => request(`/projects/${id}/sessions`),
   getSession: (pid: number, sid: number) => request(`/projects/${pid}/sessions/${sid}`),
   runSession: (id: number, topic?: string) =>
-    request(`/projects/${id}/sessions/run`, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({topic})}),
+    request(`/projects/${id}/sessions/run`, jsonBody({ topic })),
   getFindings: (id: number, params?: {status?: string; category?: string; limit?: number}) => {
     const qs = new URLSearchParams();
     if (params?.status) qs.set('status', params.status);
@@ -41,4 +139,24 @@ export const api = {
     request(`/projects/${id}/scientist/run`, {method: 'POST'}),
   runDirector: (id: number) =>
     request(`/projects/${id}/director/run`, {method: 'POST'}),
+
+  // 硅基大脑 · 知识图谱
+  getKnowledgeGraph: (brainId: number, params?: {types?: string; limit?: number}): Promise<KnowledgeGraph> => {
+    const qs = new URLSearchParams();
+    if (params?.types) qs.set('types', params.types);
+    if (params?.limit) qs.set('limit', String(params.limit));
+    const s = qs.toString();
+    return request(`/brains/${brainId}/knowledge-graph${s ? `?${s}` : ''}`);
+  },
+  getBrainFrontier: (brainId: number, params?: {limit?: number; confidence_ceiling?: number}): Promise<BrainFrontier> => {
+    const qs = new URLSearchParams();
+    if (params?.limit) qs.set('limit', String(params.limit));
+    if (params?.confidence_ceiling !== undefined) qs.set('confidence_ceiling', String(params.confidence_ceiling));
+    const s = qs.toString();
+    return request(`/brains/${brainId}/frontier${s ? `?${s}` : ''}`);
+  },
 };
+
+// 命名导出方便直接 import
+export const fetchKnowledgeGraph = (brainId: number) => api.getKnowledgeGraph(brainId);
+export const fetchBrainFrontier = (brainId: number) => api.getBrainFrontier(brainId);

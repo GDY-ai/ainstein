@@ -1,11 +1,54 @@
-import { Routes, Route } from 'react-router-dom'
+import { Routes, Route, Navigate } from 'react-router-dom'
 import Dashboard from './pages/Dashboard'
 import ProjectDetail from './pages/ProjectDetail'
+import BrainView from './pages/BrainView'
+import Login from './pages/Login'
+import BrainList from './pages/BrainList'
+import CreateBrain from './pages/CreateBrain'
+import { getToken } from './api'
+
+function RequireAuth({ children }: { children: JSX.Element }) {
+  const token = getToken()
+  if (!token) return <Navigate to="/login" replace />
+  return children
+}
 
 export default function App() {
   return (
     <Routes>
-      <Route path="/" element={<Dashboard />} />
+      <Route path="/login" element={<Login />} />
+      <Route
+        path="/"
+        element={
+          getToken() ? <Navigate to="/brains" replace /> : <Navigate to="/login" replace />
+        }
+      />
+      <Route
+        path="/brains"
+        element={
+          <RequireAuth>
+            <BrainList />
+          </RequireAuth>
+        }
+      />
+      <Route
+        path="/brains/new"
+        element={
+          <RequireAuth>
+            <CreateBrain />
+          </RequireAuth>
+        }
+      />
+      <Route
+        path="/brain/:brainId"
+        element={
+          <RequireAuth>
+            <BrainView />
+          </RequireAuth>
+        }
+      />
+      {/* Legacy routes preserved for backward compatibility */}
+      <Route path="/dashboard" element={<Dashboard />} />
       <Route path="/project/:id" element={<ProjectDetail />} />
     </Routes>
   )

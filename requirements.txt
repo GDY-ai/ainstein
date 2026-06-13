@@ -1,0 +1,6 @@
+flask>=2.3
+gunicorn>=21.0
+anthropic>=0.25
+apscheduler>=3.10
+itsdangerous>=2.1
+werkzeug>=2.3

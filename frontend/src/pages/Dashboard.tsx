@@ -9,6 +9,7 @@ export default function Dashboard() {
   const [name, setName] = useState('')
   const [mission, setMission] = useState('')
   const [domain, setDomain] = useState('')
+  const [brainIdInput, setBrainIdInput] = useState('1')
   const navigate = useNavigate()
 
   useEffect(() => { load() }, [])
@@ -27,6 +28,12 @@ export default function Dashboard() {
     load()
   }
 
+  function openBrain() {
+    const id = Number(brainIdInput)
+    if (!id || Number.isNaN(id)) return
+    navigate(`/brain/${id}`)
+  }
+
   const totalFindings = projects.reduce((s, p) => s + (p.stats?.findings_total || 0), 0)
   const totalSessions = projects.reduce((s, p) => s + (p.stats?.sessions_completed || 0), 0)
 
@@ -40,9 +47,26 @@ export default function Dashboard() {
             </h1>
             <p style={{color: 'var(--text2)'}}>AI 深度研究平台</p>
           </div>
-          <button onClick={() => setShowCreate(true)} style={btnStyle}>
-            + 新建项目
-          </button>
+          <div style={{display: 'flex', alignItems: 'center', gap: 12}}>
+            <div style={{display: 'flex', alignItems: 'center', gap: 6, background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 6, padding: '4px 8px 4px 12px'}}>
+              <span style={{fontSize: 12, color: 'var(--text2)', letterSpacing: 1}}>🧠 大脑</span>
+              <input
+                value={brainIdInput}
+                onChange={e => setBrainIdInput(e.target.value.replace(/[^0-9]/g, ''))}
+                onKeyDown={e => e.key === 'Enter' && openBrain()}
+                style={{width: 50, background: 'transparent', border: 'none', color: 'var(--text)', fontSize: 13, outline: 'none', textAlign: 'center'}}
+                placeholder="ID"
+              />
+              <button
+                onClick={openBrain}
+                style={{background: 'var(--bg3)', color: 'var(--accent2)', border: '1px solid var(--border)', borderRadius: 4, padding: '2px 10px', cursor: 'pointer', fontSize: 12}}
+                title="进入硅基大脑可视化"
+              >→</button>
+            </div>
+            <button onClick={() => setShowCreate(true)} style={btnStyle}>
+              + 新建项目
+            </button>
+          </div>
         </div>
 
         <div style={{display: 'flex', gap: 16, marginBottom: 32}}>

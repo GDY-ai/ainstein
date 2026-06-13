@@ -1,0 +1,15 @@
+schema_version: 1
+module_path: backend
+title: 硅基大脑多智能体研究编排核心
+scope:
+    - agents/
+    - engines/
+    - tools/
+    - app.py
+    - config.py
+    - database.py
+    - wsgi.py
+source_files: []
+depends_on: []
+related_to:
+    - path: frontend
