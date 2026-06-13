@@ -678,6 +678,9 @@ class ATAOrchestrator:
             return False
 
         # 构造伪事件供 react_to_event 使用
+        # 注：framework._build_context_from_event 会从 brains 表读取 seed_question
+        # 作为研究课题（research_topic），所以这里 payload 不必（也不应）携带
+        # "种子问题 / frontier" 这类系统术语字样，避免 LLM 把它们当作思考对象。
         if target_ce:
             pseudo_event = {
                 "event_id": f"frontier-{brain_id}-{int(time.time())}",
@@ -687,19 +690,18 @@ class ATAOrchestrator:
                     "ce_id": target_ce.get("id"),
                     "type": target_ce.get("type"),
                     "title": (target_ce.get("payload") or {}).get("title", ""),
-                    "_source": "frontier_explore",
                 },
                 "source_agent_id": None,
             }
         else:
-            # 完全空大脑 → 让 explorer 从种子问题开始
-            brain = get_brain(brain_id)
-            seed = (brain or {}).get("seed_question", "")
+            # 完全空大脑 → 让 explorer 直接围绕研究课题进行首轮思考；
+            # 不在 payload 里塞 seed_question / _source 字样，研究课题由
+            # framework 从 brains 表自动注入。
             pseudo_event = {
                 "event_id": f"seed-{brain_id}-{int(time.time())}",
                 "type": EventTypes.USER_SEED_QUESTION_SUBMITTED,
                 "brain_id": brain_id,
-                "payload": {"seed_question": seed, "_source": "auto_seed"},
+                "payload": {},
                 "source_agent_id": None,
             }
 

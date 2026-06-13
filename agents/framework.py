@@ -120,6 +120,9 @@ class ThinkingContext:
     brain_id: int
     """所属硅基大脑 id。"""
 
+    research_topic: str = ""
+    """大脑的核心研究课题（即用户提出的种子问题原文）。所有思考必须围绕它展开。"""
+
     trigger_event: Optional[Dict[str, Any]] = None
     """触发本次思考的事件对象（与 EventBus dispatch 出的 dict 同结构）。"""
 
@@ -366,7 +369,10 @@ def _build_role_prompt(role_name: str, config: Dict[str, Any]) -> str:
 }}}}
 ```
 
-# 重要约束
+# 重要约束（必须严格遵守）
+- 你的全部产出必须围绕「研究课题」（即用户提出的真实问题）展开，输出客观、具体的研究内容：事实、证据、假设、推论、子问题、反例等。
+- 严禁把「研究课题」这件事本身当作哲学概念去元分析；严禁分析任意词语（例如「问题」「种子」「边界」「思考」等）的隐喻、生长性、认知层次或哲学含义。
+- 想象你的产出会被一个对该课题感兴趣的外行人直接阅读 —— 它必须是关于课题本身的实质内容，而不是对系统、对提示词、对 Agent 流程的元思考。
 - 与其他 Agent **完全平等**，没有上下级；通过观点博弈而非命令协作。
 - 坚持「求同存异」：发现矛盾时优先记录为 ``counter_evidence`` / ``dissent``，不要强行调和。
 - ``new_elements`` 至少 1 条；多了也无所谓，但务必聚焦于你的角色偏好。
@@ -591,6 +597,8 @@ class BaseAgent:
         - 若 payload 中含 ``ce_id`` / ``hypothesis_id`` / ``conclusion_id`` 等，
           会拉取该 CE 及其邻居作为 relevant_ces。
         - 同时附上最近 observation 与 frontier 作为锚点。
+        - 始终从 brains 表读取 seed_question 作为研究课题（research_topic），
+          确保 Agent 永远知道在研究什么。
         """
         payload = event.get("payload") or {}
         relevant_ids: List[int] = []
@@ -617,8 +625,18 @@ class BaseAgent:
         except Exception:
             current_frontier = []
 
+        # 读取大脑研究课题（seed_question）—— Agent 永远围绕它思考
+        research_topic = ""
+        try:
+            brain_row = db.get_brain(self.brain_id)
+            if brain_row:
+                research_topic = (brain_row.get("seed_question") or "").strip()
+        except Exception:
+            logger.exception("读取 brain.seed_question 失败 brain=%s", self.brain_id)
+
         return ThinkingContext(
             brain_id=self.brain_id,
+            research_topic=research_topic,
             trigger_event=event,
             relevant_ces=relevant_ces,
             recent_observations=recent_observations,
@@ -626,14 +644,14 @@ class BaseAgent:
         )
 
     def _build_user_prompt(self, context: ThinkingContext) -> str:
-        """生成 user 消息（仅一句指令；上下文已经塞进 system prompt）。"""
-        trigger = context.trigger_event or {}
-        if trigger:
-            return (
-                f"请基于上下文进行一次思考。本次触发来自事件：{trigger.get('type')}。"
-                f"严格按 system prompt 中约定的 JSON Schema 输出。"
-            )
-        return "请基于上下文进行一次自主思考，并按 JSON Schema 输出。"
+        """生成 user 消息：聚焦研究课题，避免暴露系统术语。"""
+        topic = (context.research_topic or "").strip() or "（未提供研究课题，请基于上下文中的相关认知元素推断真实课题）"
+        return (
+            f"你正在研究的课题是：\n《{topic}》\n\n"
+            f"请围绕这个课题本身展开真正的研究性思考——产出与课题内容直接相关的"
+            f"事实、证据、假设、推论或新的子问题。不要分析问题的形式、措辞或任何词语的隐喻。"
+            f"严格按 system prompt 中约定的 JSON Schema 输出，禁止输出任何 JSON 之外的文字。"
+        )
 
     # ---------- 解析 LLM 输出 ----------
     def _parse_llm_output(self, raw: str) -> ThinkingResult:
@@ -864,24 +882,37 @@ def _format_personality_block(personality: Dict[str, float]) -> str:
 
 
 def _format_context_block(context: ThinkingContext) -> str:
-    """把 ``ThinkingContext`` 格式化为 prompt 可读文本。"""
+    """把 ``ThinkingContext`` 格式化为 prompt 可读文本。
+
+    设计原则：
+    - 把「研究课题」放在最前、最显眼，让 LLM 一眼就知道在研究什么。
+    - 不暴露事件类型、payload 等系统术语，避免 LLM 把它们误当作思考对象。
+    - 用自然中文描述「已有思考 / 已知观察 / 待深入方向」，避免 frontier / cognitive
+      element 等抽象词造成的元思考。
+    """
     parts: List[str] = []
-    trigger = context.trigger_event or {}
-    if trigger:
-        parts.append(f"## 触发事件\n类型：{trigger.get('type')}\n"
-                     f"payload：{json.dumps(trigger.get('payload') or {}, ensure_ascii=False)[:500]}")
+    topic = (context.research_topic or "").strip()
+    if topic:
+        parts.append(
+            "## 你的研究课题（必须围绕这个课题本身产出实质内容）\n"
+            f"《{topic}》\n\n"
+            "下面列出的是大脑围绕该课题已经积累的研究内容；请把它们当作你思考的依据，"
+            "在此基础上产出新的、关于课题本身的研究内容（事实 / 证据 / 假设 / 推论 / "
+            "子问题 / 反例）。不要把「课题」当作哲学概念去元分析，也不要分析任何词语的隐喻。"
+        )
+
     if context.relevant_ces:
-        parts.append("## 相关认知元素（可在 new_relations 中以 target_id 引用）")
+        parts.append("## 与课题直接相关的已有思考（可在 new_relations 的 target_id 中引用）")
         parts.append(_format_ce_list(context.relevant_ces, limit=10))
     if context.recent_observations:
-        parts.append("## 最近的观察")
+        parts.append("## 关于课题的近期观察")
         parts.append(_format_ce_list(context.recent_observations, limit=5))
     if context.current_frontier:
-        parts.append("## 当前认知边界（待开拓）")
+        parts.append("## 围绕课题仍待深入的方向")
         parts.append(_format_ce_list(context.current_frontier, limit=8))
     if context.extra:
         parts.append("## 附加信息\n" + json.dumps(context.extra, ensure_ascii=False)[:500])
-    return "\n\n".join(parts) if parts else "（暂无上下文，请进行自主探索式思考）"
+    return "\n\n".join(parts) if parts else "（暂无既有积累，请围绕研究课题做首轮研究性探索）"
 
 
 def _format_ce_list(ces: List[Dict[str, Any]], limit: int = 10) -> str:

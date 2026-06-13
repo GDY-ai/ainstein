@@ -141,12 +141,32 @@ export const api = {
     request(`/projects/${id}/director/run`, {method: 'POST'}),
 
   // 硅基大脑 · 知识图谱
-  getKnowledgeGraph: (brainId: number, params?: {types?: string; limit?: number}): Promise<KnowledgeGraph> => {
+  getKnowledgeGraph: async (brainId: number, params?: {types?: string; limit?: number}): Promise<KnowledgeGraph> => {
     const qs = new URLSearchParams();
     if (params?.types) qs.set('types', params.types);
     if (params?.limit) qs.set('limit', String(params.limit));
     const s = qs.toString();
-    return request(`/brains/${brainId}/knowledge-graph${s ? `?${s}` : ''}`);
+    const raw = await request(`/brains/${brainId}/knowledge-graph${s ? `?${s}` : ''}`);
+    // 规范化字段名（后端返回格式 → 前端期望格式）
+    return {
+      nodes: (raw.nodes || []).map((n: any) => ({
+        id: n.id,
+        ce_type: n.ce_type || n.type || 'question',
+        title: n.title || n.label || n.content?.slice(0, 30) || '',
+        content: n.content || '',
+        confidence: n.confidence ?? 0.5,
+        status: n.status || 'open',
+        created_at: n.created_at || '',
+        metadata: n.metadata || n.domain_tags || '',
+      })),
+      edges: (raw.edges || []).map((e: any) => ({
+        id: e.id,
+        source_id: e.source_id ?? e.source,
+        target_id: e.target_id ?? e.target,
+        relation_type: e.relation_type || e.relation || 'relates_to',
+        weight: e.weight ?? e.strength ?? 0.5,
+      })),
+    };
   },
   getBrainFrontier: (brainId: number, params?: {limit?: number; confidence_ceiling?: number}): Promise<BrainFrontier> => {
     const qs = new URLSearchParams();
